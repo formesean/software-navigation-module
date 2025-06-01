@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "ring_buffer.hpp"
+#include "spi_comm.hpp"
+
 // Pin Definitions
 const uint8_t MACRO_KEYS[5] = {5, 6, 7, 8, 9};
 const uint8_t ENCODER_SW = 2;
@@ -14,6 +17,9 @@ const uint8_t ENCODER_CLK = 4;
 const uint8_t LED_PIN = 25;
 
 // State Variables
+RingBuffer ringBuffer;
+SPIComm spiComm;
+
 volatile bool led_blink_requested = false;
 volatile int32_t encoder_position = 0;
 volatile uint8_t encoder_last_state = 0;
@@ -38,6 +44,9 @@ int main()
 {
   wait_for_usb_connect();
   setup_pins();
+
+  spiComm.init_slave();
+  // spiComm.set_message("Hello World!");
 
   encoder_last_state = (gpio_get(ENCODER_CLK) << 1) | gpio_get(ENCODER_DT);
 
@@ -67,14 +76,34 @@ int main()
         prev_state[i] = current_state;
 
         if (!current_state)
-          printf("Key %d: Pressed\n", i + 1);
+        {
+          Packet pkt = spiComm.create_packet(
+              PacketType::MacroKey,
+              static_cast<MacroKeyAction>(i + 1),
+              SwitchValue::Pressed);
+
+          ringBuffer.push(pkt);
+          spiComm.print_packet(pkt);
+          // printf("Key %d: Pressed\n", i + 1);
+        }
         else
-          printf("Key %d: Released\n", i + 1);
+        {
+          Packet pkt = spiComm.create_packet(
+              PacketType::MacroKey,
+              static_cast<MacroKeyAction>(i + 1),
+              SwitchValue::Released);
+
+          ringBuffer.push(pkt);
+          spiComm.print_packet(pkt);
+          // printf("Key %d: Released\n", i + 1);
+        }
 
         request_led_blink();
         fflush(stdout);
       }
     }
+
+    // spiComm.handle(ringBuffer);
 
     if (led_blink_requested)
     {
@@ -141,19 +170,28 @@ void encoder_shared_irq_handler()
   {
     if (absolute_time_diff_us(last_encoder_event, now) > ENCODER_DEBOUNCE_US)
     {
+      last_encoder_event = now;
       uint32_t status = save_and_disable_interrupts();
 
       uint8_t current_state = (gpio_get(ENCODER_DT) << 1) | gpio_get(ENCODER_CLK);
       uint8_t index = (encoder_last_state << 2) | current_state;
       int8_t delta = encoder_transition_table[index & 0x0F];
 
-      encoder_position += delta;
+      encoder_position = encoder_position + delta;
       encoder_last_state = current_state;
       restore_interrupts(status);
 
       if (delta != 0)
       {
-        printf("Encoder: %d (%s)\n", encoder_position, delta > 0 ? "CW" : "CCW");
+        // printf("Encoder: %d (%s)\n", encoder_position, delta > 0 ? "CW" : "CCW");
+
+        Packet pkt = spiComm.create_packet(
+            PacketType::EncoderRotate,
+            delta > 0 ? EncoderRotationAction::CW : EncoderRotationAction::CCW,
+            static_cast<uint8_t>(abs(delta)));
+
+        ringBuffer.push(pkt);
+        spiComm.print_packet(pkt);
         request_led_blink();
         fflush(stdout);
       }
@@ -168,10 +206,18 @@ void encoder_shared_irq_handler()
   {
     if (absolute_time_diff_us(last_encoder_button_event, now) > ENCODER_SW_DEBOUNCE_US)
     {
+      last_encoder_button_event = now;
       gpio_acknowledge_irq(ENCODER_SW, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
       bool pressed = !gpio_get(ENCODER_SW);
 
-      printf("Encoder Switch: %s\n", pressed ? "Pressed" : "Released");
+      // printf("Encoder Switch: %s\n", pressed ? "Pressed" : "Released");
+
+      Packet pkt = spiComm.create_packet(
+          PacketType::EncoderSwitch,
+          pressed ? SwitchValue::Pressed : SwitchValue::Released);
+
+      ringBuffer.push(pkt);
+      spiComm.print_packet(pkt);
       request_led_blink();
       fflush(stdout);
     }
