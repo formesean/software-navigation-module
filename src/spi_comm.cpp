@@ -15,54 +15,41 @@ uint8_t SPIComm::compute_checksum(uint8_t type, uint8_t action, uint8_t value)
 void SPIComm::init_slave()
 {
   spi_init(spi1, SPI_BAUD);
+  spi_set_format(spi1, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  spi_set_slave(spi1, true);
+
   gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
   gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
   gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
   gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
-  spi_set_slave(spi1, true);
 }
 
 void SPIComm::handle(RingBuffer &ring)
 {
-  if (spi_is_readable(spi1) || spi_is_writable(spi1))
+  uint8_t rx_buf[PACKET_SIZE] = {0};
+  uint8_t tx_buf[PACKET_SIZE] = {0};
+
+  Packet packet_to_send;
+
+  if (ring.pop(packet_to_send))
   {
-    uint8_t rx_buf[PACKET_SIZE] = {0};
-    uint8_t tx_buf[PACKET_SIZE] = {0};
+    auto packet_array = packet_to_send.to_array();
+    memcpy(tx_buf, packet_array.data(), PACKET_SIZE);
 
-    Packet response_packet;
-    if (ring.pop(response_packet))
+    uint8_t high_byte = ((tx_buf[0] & 0x0F) << 4) | (tx_buf[1] & 0x0F);
+    uint8_t low_byte = ((tx_buf[2] & 0x0F) << 4) | (tx_buf[3] & 0x0F);
+
+    uint16_t tx_data = (static_cast<uint16_t>(high_byte) << 8) | low_byte;
+    uint16_t rx_dummy = 0;
+
+    int result = spi_write16_read16_blocking(spi1, &tx_data, &rx_dummy, 1);
+
+    if (result == 1)
     {
-      auto packet_array = response_packet.to_array();
-      memcpy(tx_buf, packet_array.data(), PACKET_SIZE);
-    }
-
-    int bytes_transferred = spi_write_read_blocking(spi1, tx_buf, rx_buf, PACKET_SIZE);
-
-    if (bytes_transferred == PACKET_SIZE)
-    {
-      bool has_data = false;
-      for (int i = 0; i < PACKET_SIZE; i++)
-      {
-        if (rx_buf[i] != 0)
-        {
-          has_data = true;
-          break;
-        }
-      }
-
-      if (has_data)
-      {
-        Packet received_packet;
-        std::array<uint8_t, PACKET_SIZE> rx_array;
-        memcpy(rx_array.data(), rx_buf, PACKET_SIZE);
-        received_packet.from_array(rx_array);
-
-        if (verify_packet(received_packet))
-        {
-          printf("Received valid packet from master\n");
-          print_packet(received_packet);
-        }
-      }
+      printf("Packet Sent: 0x%04X\n", tx_data);
+      printf("Original packet data: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n",
+             tx_buf[0], tx_buf[1], tx_buf[2], tx_buf[3]);
+      fflush(stdout);
     }
   }
 }
