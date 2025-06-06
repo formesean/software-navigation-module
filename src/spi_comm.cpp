@@ -24,39 +24,45 @@ void SPIComm::init_slave()
 
 void SPIComm::handle(RingBuffer &ring)
 {
-  if (spi_is_readable(spi1))
+  if (spi_is_readable(spi1) || spi_is_writable(spi1))
   {
     uint8_t rx_buf[PACKET_SIZE] = {0};
     uint8_t tx_buf[PACKET_SIZE] = {0};
 
-    // Read packet from SPI
-    spi_read_blocking(spi1, 0x00, rx_buf, PACKET_SIZE);
-
-    Packet received_packet;
-    memcpy(&received_packet, rx_buf, PACKET_SIZE);
-
-    // Verify and push if valid
-    if (verify_packet(received_packet))
+    Packet response_packet;
+    if (ring.pop(response_packet))
     {
-      print_packet(received_packet);
-      ring.push(received_packet);
+      auto packet_array = response_packet.to_array();
+      memcpy(tx_buf, packet_array.data(), PACKET_SIZE);
     }
 
-    // Send dynamic message instead of packet
-    if (tx_length > 0)
-    {
-      spi_write_blocking(spi1, tx_buffer, tx_length);
-      tx_length = 0;
-    }
-    else
-    {
-      Packet response_packet;
-      if (!ring.pop(response_packet))
-        memset(&response_packet, 0, sizeof(Packet));
+    int bytes_transferred = spi_write_read_blocking(spi1, tx_buf, rx_buf, PACKET_SIZE);
 
-      uint8_t tx_buf[PACKET_SIZE] = {0};
-      memcpy(tx_buf, &response_packet, PACKET_SIZE);
-      spi_write_blocking(spi1, tx_buf, PACKET_SIZE);
+    if (bytes_transferred == PACKET_SIZE)
+    {
+      bool has_data = false;
+      for (int i = 0; i < PACKET_SIZE; i++)
+      {
+        if (rx_buf[i] != 0)
+        {
+          has_data = true;
+          break;
+        }
+      }
+
+      if (has_data)
+      {
+        Packet received_packet;
+        std::array<uint8_t, PACKET_SIZE> rx_array;
+        memcpy(rx_array.data(), rx_buf, PACKET_SIZE);
+        received_packet.from_array(rx_array);
+
+        if (verify_packet(received_packet))
+        {
+          printf("Received valid packet from master\n");
+          print_packet(received_packet);
+        }
+      }
     }
   }
 }
@@ -64,7 +70,7 @@ void SPIComm::handle(RingBuffer &ring)
 void SPIComm::print_packet(const Packet &pkt)
 {
   bool is_valid = verify_packet(pkt);
-  printf("Packet - Type: 0x%02X, Action: 0x%02X, Value: 0x%02X, Checksum: 0x%02X, Verified: %s\n",
+  printf("Packet - Type: 0x%02X, Action: 0x%02X, Value: 0x%02X, Checksum: 0x%02X, Valid: %s\n",
          static_cast<uint8_t>(pkt.get_type()),
          pkt.get_action(),
          pkt.get_value(),
@@ -87,7 +93,7 @@ Packet SPIComm::create_packet(PacketType type, MacroKeyAction action, SwitchValu
   pkt.set_type(type);
   pkt.set_action(static_cast<uint8_t>(action));
   pkt.set_value(static_cast<uint8_t>(value));
-  pkt.set_checksum(compute_checksum(static_cast<uint8_t>(type), static_cast<uint8_t>(action), static_cast<uint8_t>(value)));
+  pkt.compute_and_set_checksum();
   return pkt;
 }
 
@@ -97,7 +103,7 @@ Packet SPIComm::create_packet(PacketType type, EncoderRotationAction action, uin
   pkt.set_type(type);
   pkt.set_action(static_cast<uint8_t>(action));
   pkt.set_value(value);
-  pkt.set_checksum(compute_checksum(static_cast<uint8_t>(type), static_cast<uint8_t>(action), value));
+  pkt.compute_and_set_checksum();
   return pkt;
 }
 
@@ -107,7 +113,7 @@ Packet SPIComm::create_packet(PacketType type, SwitchValue value)
   pkt.set_type(type);
   pkt.set_action(static_cast<uint8_t>(0x01));
   pkt.set_value(static_cast<uint8_t>(value));
-  pkt.set_checksum(compute_checksum(static_cast<uint8_t>(type), static_cast<uint8_t>(0x01), static_cast<uint8_t>(value)));
+  pkt.compute_and_set_checksum();
   return pkt;
 }
 

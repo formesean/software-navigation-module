@@ -84,7 +84,6 @@ int main()
 
           ringBuffer.push(pkt);
           spiComm.print_packet(pkt);
-          // printf("Key %d: Pressed\n", i + 1);
         }
         else
         {
@@ -95,7 +94,6 @@ int main()
 
           ringBuffer.push(pkt);
           spiComm.print_packet(pkt);
-          // printf("Key %d: Released\n", i + 1);
         }
 
         request_led_blink();
@@ -103,7 +101,7 @@ int main()
       }
     }
 
-    // spiComm.handle(ringBuffer);
+    spiComm.handle(ringBuffer);
 
     if (led_blink_requested)
     {
@@ -113,6 +111,7 @@ int main()
       gpio_put(LED_PIN, 0);
     }
 
+    sleep_us(100);
     tight_loop_contents();
   }
 
