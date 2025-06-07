@@ -3,8 +3,6 @@
 
 #include <cstdint>
 #include <array>
-#include <cstring>
-#include <iostream>
 
 constexpr size_t PACKET_SIZE = 4;
 
@@ -36,63 +34,63 @@ enum class SwitchValue : uint8_t
   Released = 0x00,
 };
 
-class Packet
+struct Packet
 {
-private:
-  PacketType _type;
-  uint8_t _action;
-  uint8_t _value;
-  uint8_t _checksum;
+  PacketType type;
+  uint8_t action;
+  uint8_t value;
+  uint8_t checksum;
 
-  static uint8_t compute_checksum(PacketType type, uint8_t action, uint8_t value)
-  {
-    return static_cast<uint8_t>(type) ^ (action) ^ (value);
-  }
-
-public:
   Packet() = default;
 
-  // Getters
-  PacketType get_type() const { return _type; }
-  uint8_t get_action() const { return _action; }
-  uint8_t get_value() const { return _value; }
-  uint8_t get_checksum() const { return _checksum; }
+  Packet(PacketType t, uint8_t a, uint8_t v)
+      : type(t), action(a), value(v), checksum(compute_checksum(t, a, v)) {}
 
-  // Setters
-  void set_type(PacketType type) { _type = type; }
-  void set_action(uint8_t action) { _action = action; }
-  void set_value(uint8_t value) { _value = value; }
-  void set_checksum(uint8_t checksum) { _checksum = checksum; }
-
-  // Calculate and assign checksum
-  void compute_and_set_checksum()
+  static Packet macro_key(MacroKeyAction key, SwitchValue state)
   {
-    _checksum = compute_checksum(_type, _action, _value);
+    return Packet(PacketType::MacroKey, static_cast<uint8_t>(key), static_cast<uint8_t>(state));
   }
 
-  // Convert to byte array for SPI transmission
-  std::array<uint8_t, PACKET_SIZE> to_array() const
+  static Packet encoder_rotate(EncoderRotationAction direction, uint8_t steps = 1)
   {
-    return {
-        static_cast<uint8_t>(_type),
-        _action,
-        _value,
-        _checksum};
+    return Packet(PacketType::EncoderRotate, static_cast<uint8_t>(direction), steps);
   }
 
-  // Load from byte array (from SPI buffer)
-  void from_array(const std::array<uint8_t, PACKET_SIZE> &data)
+  static Packet encoder_switch(SwitchValue state)
   {
-    _type = static_cast<PacketType>(data[0]);
-    _action = data[1];
-    _value = data[2];
-    _checksum = data[3];
+    return Packet(PacketType::EncoderSwitch, 0x01, static_cast<uint8_t>(state));
   }
 
-  // Validate if checksum matches the type, action, value
-  bool validate_checksum() const
+  std::array<uint8_t, PACKET_SIZE> to_bytes() const
   {
-    return _checksum == compute_checksum(_type, _action, _value);
+    return {static_cast<uint8_t>(type), action, value, checksum};
+  }
+
+  void from_bytes(const std::array<uint8_t, PACKET_SIZE> &data)
+  {
+    type = static_cast<PacketType>(data[0]);
+    action = data[1];
+    value = data[2];
+    checksum = data[3];
+  }
+
+  bool is_valid() const
+  {
+    return checksum == compute_checksum(type, action, value);
+  }
+
+  uint16_t to_spi_word() const
+  {
+    auto bytes = to_bytes();
+    uint8_t high = ((bytes[0] & 0x0F) << 4) | (bytes[1] & 0x0F);
+    uint8_t low = ((bytes[2] & 0x0F) << 4) | (bytes[3] & 0x0F);
+    return (static_cast<uint16_t>(high) << 8) | low;
+  }
+
+private:
+  static uint8_t compute_checksum(PacketType t, uint8_t a, uint8_t v)
+  {
+    return static_cast<uint8_t>(t) ^ a ^ v;
   }
 };
 

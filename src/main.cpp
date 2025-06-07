@@ -18,15 +18,17 @@ const uint8_t LED_PIN = 25;
 
 // State Variables
 RingBuffer ringBuffer;
-SPIComm spiComm;
 
 volatile bool led_blink_requested = false;
 volatile int32_t encoder_position = 0;
 volatile uint8_t encoder_last_state = 0;
 
+// Timing constants
 const uint32_t ENCODER_DEBOUNCE_US = 2000;
 const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
 const uint32_t MACRO_KEY_DEBOUNCE_US = 50000;
+
+// Encoder state transition table
 const int8_t encoder_transition_table[16] = {
     0, 1, -1, 0, -1, 0, 0, 1,
     1, 0, 0, -1, 0, -1, 1, 0};
@@ -39,14 +41,13 @@ void wait_for_usb_connect();
 void setup_pins();
 void request_led_blink();
 void encoder_shared_irq_handler();
+void process_packets();
 
 int main()
 {
   wait_for_usb_connect();
   setup_pins();
-
-  spiComm.init_slave();
-  // spiComm.set_message("Hello World!");
+  SPIComm::init_slave();
 
   encoder_last_state = (gpio_get(ENCODER_CLK) << 1) | gpio_get(ENCODER_DT);
 
@@ -70,38 +71,25 @@ int main()
     for (int i = 0; i < 5; i++)
     {
       bool current_state = gpio_get(MACRO_KEYS[i]);
-      if (current_state != prev_state[i] && absolute_time_diff_us(last_debounce_time[i], now) > MACRO_KEY_DEBOUNCE_US)
+      if (current_state != prev_state[i] &&
+          absolute_time_diff_us(last_debounce_time[i], now) > MACRO_KEY_DEBOUNCE_US)
       {
+
         last_debounce_time[i] = now;
         prev_state[i] = current_state;
 
-        if (!current_state)
-        {
-          Packet pkt = spiComm.create_packet(
-              PacketType::MacroKey,
-              static_cast<MacroKeyAction>(i + 1),
-              SwitchValue::Pressed);
+        auto packet = Packet::macro_key(
+            static_cast<MacroKeyAction>(i + 1),
+            current_state ? SwitchValue::Released : SwitchValue::Pressed);
 
-          ringBuffer.push(pkt);
-          spiComm.print_packet(pkt);
-        }
-        else
-        {
-          Packet pkt = spiComm.create_packet(
-              PacketType::MacroKey,
-              static_cast<MacroKeyAction>(i + 1),
-              SwitchValue::Released);
-
-          ringBuffer.push(pkt);
-          spiComm.print_packet(pkt);
-        }
-
+        ringBuffer.push(packet);
+        SPIComm::print_packet(packet);
         request_led_blink();
         fflush(stdout);
       }
     }
 
-    spiComm.handle(ringBuffer);
+    process_packets();
 
     if (led_blink_requested)
     {
@@ -164,7 +152,7 @@ void encoder_shared_irq_handler()
 {
   absolute_time_t now = get_absolute_time();
 
-  // Handle encoder rotation (both CLK and DT edges)
+  // Handle encoder rotation
   if (gpio_get_irq_event_mask(ENCODER_CLK) || gpio_get_irq_event_mask(ENCODER_DT))
   {
     if (absolute_time_diff_us(last_encoder_event, now) > ENCODER_DEBOUNCE_US)
@@ -176,21 +164,18 @@ void encoder_shared_irq_handler()
       uint8_t index = (encoder_last_state << 2) | current_state;
       int8_t delta = encoder_transition_table[index & 0x0F];
 
-      encoder_position = encoder_position + delta;
+      encoder_position += delta;
       encoder_last_state = current_state;
       restore_interrupts(status);
 
       if (delta != 0)
       {
-        // printf("Encoder: %d (%s)\n", encoder_position, delta > 0 ? "CW" : "CCW");
-
-        Packet pkt = spiComm.create_packet(
-            PacketType::EncoderRotate,
+        auto packet = Packet::encoder_rotate(
             delta > 0 ? EncoderRotationAction::CW : EncoderRotationAction::CCW,
             static_cast<uint8_t>(abs(delta)));
 
-        ringBuffer.push(pkt);
-        spiComm.print_packet(pkt);
+        ringBuffer.push(packet);
+        SPIComm::print_packet(packet);
         request_led_blink();
         fflush(stdout);
       }
@@ -207,19 +192,24 @@ void encoder_shared_irq_handler()
     {
       last_encoder_button_event = now;
       gpio_acknowledge_irq(ENCODER_SW, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
+
       bool pressed = !gpio_get(ENCODER_SW);
+      auto packet = Packet::encoder_switch(pressed ? SwitchValue::Pressed : SwitchValue::Released);
 
-      // printf("Encoder Switch: %s\n", pressed ? "Pressed" : "Released");
-
-      Packet pkt = spiComm.create_packet(
-          PacketType::EncoderSwitch,
-          pressed ? SwitchValue::Pressed : SwitchValue::Released);
-
-      ringBuffer.push(pkt);
-      spiComm.print_packet(pkt);
+      ringBuffer.push(packet);
+      SPIComm::print_packet(packet);
       request_led_blink();
       fflush(stdout);
     }
+  }
+}
+
+void process_packets()
+{
+  Packet packet;
+  if (ringBuffer.pop(packet))
+  {
+    SPIComm::send_packet(packet);
   }
 }
 

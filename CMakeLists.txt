@@ -13,7 +13,6 @@ include_directories(include)
 
 add_executable(${PROJECT_NAME}
   src/main.cpp
-  src/spi_comm.cpp
 )
 
 target_link_libraries(${PROJECT_NAME} pico_stdlib hardware_spi hardware_irq hardware_pio)
