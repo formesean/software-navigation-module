@@ -45,7 +45,8 @@ void process_packets();
 
 int main()
 {
-  wait_for_usb_connect();
+  stdio_init_all();
+  // wait_for_usb_connect();
   setup_pins();
   SPIComm::init_slave();
 
@@ -108,8 +109,6 @@ int main()
 
 void wait_for_usb_connect()
 {
-  stdio_init_all();
-
   absolute_time_t timeout = make_timeout_time_ms(5000);
   while (!stdio_usb_connected() && !time_reached(timeout))
     sleep_ms(10);
