@@ -4,59 +4,78 @@
 #include <stdint.h>
 #include <cstddef>
 
-#include "packet.hpp"
-
 constexpr size_t BUFFER_SIZE = 32;
 
 class RingBuffer
 {
 private:
-  Packet buffer[BUFFER_SIZE];
-  int head = 0;
-  int tail = 0;
-  int count = 0;
+  uint16_t buffer[BUFFER_SIZE];
+  volatile int head = 0;
+  volatile int tail = 0;
+  volatile int count = 0;
 
 public:
-  bool push(const Packet &p)
+  inline bool push(uint16_t event_data)
   {
-    if (count >= BUFFER_SIZE)
-      return false;
+    uint32_t status = save_and_disable_interrupts();
 
-    buffer[head] = p;
+    if (count >= BUFFER_SIZE)
+    {
+      restore_interrupts(status);
+      return false;
+    }
+
+    buffer[head] = event_data;
     head = (head + 1) % BUFFER_SIZE;
     ++count;
+
+    restore_interrupts(status);
     return true;
   }
 
-  bool pop(Packet &out)
+  inline bool pop(uint16_t &out)
   {
+    uint32_t status = save_and_disable_interrupts();
+
     if (count == 0)
+    {
+      restore_interrupts(status);
       return false;
+    }
 
     out = buffer[tail];
     tail = (tail + 1) % BUFFER_SIZE;
     --count;
+
+    restore_interrupts(status);
     return true;
   }
 
-  bool is_empty() const
+  inline bool is_empty() const
   {
     return count == 0;
   }
 
-  bool is_full() const
+  inline bool is_full() const
   {
     return count == BUFFER_SIZE;
   }
 
-  size_t size() const
+  inline size_t size() const
   {
     return count;
   }
 
-  void clear()
+  inline void clear()
   {
+    uint32_t status = save_and_disable_interrupts();
     head = tail = count = 0;
+    restore_interrupts(status);
+  }
+
+  inline uint8_t utilization_percent() const
+  {
+    return (count * 100) / BUFFER_SIZE;
   }
 };
 

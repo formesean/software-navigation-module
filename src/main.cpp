@@ -24,9 +24,9 @@ volatile int32_t encoder_position = 0;
 volatile uint8_t encoder_last_state = 0;
 
 // Timing constants
-const uint32_t ENCODER_DEBOUNCE_US = 2000;
+const uint32_t ENCODER_DEBOUNCE_US = 1000;
 const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
-const uint32_t MACRO_KEY_DEBOUNCE_US = 50000;
+const uint32_t MACRO_KEY_DEBOUNCE_US = 20000;
 
 // Encoder state transition table
 const int8_t encoder_transition_table[16] = {
@@ -41,7 +41,8 @@ void wait_for_usb_connect();
 void setup_pins();
 void request_led_blink();
 void encoder_shared_irq_handler();
-void process_packets();
+void process_buffered_events();
+inline bool try_send_immediate(uint16_t event_data);
 
 int main()
 {
@@ -79,18 +80,18 @@ int main()
         last_debounce_time[i] = now;
         prev_state[i] = current_state;
 
-        auto packet = Packet::macro_key(
-            static_cast<MacroKeyAction>(i + 1),
-            current_state ? SwitchValue::Released : SwitchValue::Pressed);
+        bool pressed = !current_state;
+        uint16_t event_data = SPIComm::create_macro_key_event(i + 1, pressed);
 
-        ringBuffer.push(packet);
-        SPIComm::print_packet(packet);
+        if (!try_send_immediate(event_data))
+          ringBuffer.push(event_data);
+
         request_led_blink();
         fflush(stdout);
       }
     }
 
-    process_packets();
+    process_buffered_events();
 
     if (led_blink_requested)
     {
@@ -100,7 +101,6 @@ int main()
       gpio_put(LED_PIN, 0);
     }
 
-    sleep_us(100);
     tight_loop_contents();
   }
 
@@ -165,16 +165,16 @@ void encoder_shared_irq_handler()
 
       encoder_position += delta;
       encoder_last_state = current_state;
-      restore_interrupts(status);
 
       if (delta != 0)
       {
-        auto packet = Packet::encoder_rotate(
-            delta > 0 ? EncoderRotationAction::CW : EncoderRotationAction::CCW,
-            static_cast<uint8_t>(abs(delta)));
+        bool clockwise = delta > 0;
+        uint8_t steps = static_cast<uint8_t>(abs(delta));
+        uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
 
-        ringBuffer.push(packet);
-        SPIComm::print_packet(packet);
+        if (!try_send_immediate(event_data))
+          ringBuffer.push(event_data);
+
         request_led_blink();
         fflush(stdout);
       }
@@ -193,23 +193,38 @@ void encoder_shared_irq_handler()
       gpio_acknowledge_irq(ENCODER_SW, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
 
       bool pressed = !gpio_get(ENCODER_SW);
-      auto packet = Packet::encoder_switch(pressed ? SwitchValue::Pressed : SwitchValue::Released);
+      uint16_t event_data = SPIComm::create_encoder_switch_event(pressed);
 
-      ringBuffer.push(packet);
-      SPIComm::print_packet(packet);
+      if (!try_send_immediate(event_data))
+        ringBuffer.push(event_data);
+
       request_led_blink();
       fflush(stdout);
     }
   }
 }
 
-void process_packets()
+void process_buffered_events()
 {
-  Packet packet;
-  if (ringBuffer.pop(packet))
+  uint16_t event_data;
+
+  while (ringBuffer.pop(event_data))
   {
-    SPIComm::send_packet(packet);
+    if (SPIComm::send_packet(event_data))
+    {
+      continue;
+    }
+    else
+    {
+      ringBuffer.push(event_data);
+      break;
+    }
   }
+}
+
+inline bool try_send_immediate(uint16_t event_data)
+{
+  return SPIComm::send_packet(event_data);
 }
 
 // EOF

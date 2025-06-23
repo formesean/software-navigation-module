@@ -35,7 +35,7 @@ private:
     return ((type & 0x0F) << 12) |
            ((action & 0x0F) << 8) |
            ((value & 0x0F) << 4) |
-           (checksum & 0x0F) |
+           (checksum & 0x0F);
   }
 
 public:
@@ -76,11 +76,9 @@ public:
     return pack_to_16bit(EVENT_ENCODER_SWITCH, ENCODER_BTN, value, checksum);
   }
 
-  static bool send_packet(const uint16_t &packet)
+  static bool send_packet(uint16_t tx_buffer)
   {
-    uint16_t tx_buffer = packet.;
     uint16_t rx_buffer = 0;
-
     int result = spi_write16_read16_blocking(spi1, &tx_buffer, &rx_buffer, 1);
 
     if (result == 1)
