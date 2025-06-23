@@ -9,7 +9,7 @@
 class SPIComm
 {
 private:
-  static constexpr uint32_t SPI_BAUD = 1000000;
+  static constexpr uint32_t SPI_BAUD = 20000000;
   static constexpr uint8_t PIN_SCK = 10;
   static constexpr uint8_t PIN_MISO = 11;
   static constexpr uint8_t PIN_MOSI = 12;
