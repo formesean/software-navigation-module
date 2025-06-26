@@ -36,60 +36,42 @@ const int8_t encoder_transition_table[16] = {
 absolute_time_t last_encoder_event;
 absolute_time_t last_encoder_button_event;
 
+bool prev_state[5] = {true, true, true, true, true};
+absolute_time_t last_debounce_time[5] = {0};
+
 // Function Prototypes
 void wait_for_usb_connect();
 void setup_pins();
 void request_led_blink();
-void encoder_shared_irq_handler();
+void shared_irq_handler();
 void process_buffered_events();
 
 int main()
 {
   stdio_init_all();
-  // wait_for_usb_connect();
   setup_pins();
   SPIComm::init_slave();
 
   encoder_last_state = (gpio_get(ENCODER_CLK) << 1) | gpio_get(ENCODER_DT);
 
-  irq_set_exclusive_handler(IO_IRQ_BANK0, encoder_shared_irq_handler);
+  irq_set_exclusive_handler(IO_IRQ_BANK0, shared_irq_handler);
   irq_set_enabled(IO_IRQ_BANK0, true);
 
   gpio_set_irq_enabled(ENCODER_CLK, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
   gpio_set_irq_enabled(ENCODER_DT, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
   gpio_set_irq_enabled(ENCODER_SW, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
 
+  for (int i = 0; i < 5; ++i)
+  {
+    gpio_set_irq_enabled(MACRO_KEYS[i], GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
+  }
+
   printf("Ready to scan keypad!\n");
   fflush(stdout);
 
-  static bool prev_state[5] = {true, true, true, true, true};
-  static absolute_time_t last_debounce_time[5] = {0};
-
   while (true)
   {
-    absolute_time_t now = get_absolute_time();
-
-    for (int i = 0; i < 5; i++)
-    {
-      bool current_state = gpio_get(MACRO_KEYS[i]);
-      if (current_state != prev_state[i] &&
-          absolute_time_diff_us(last_debounce_time[i], now) > MACRO_KEY_DEBOUNCE_US)
-      {
-
-        last_debounce_time[i] = now;
-        prev_state[i] = current_state;
-
-        bool pressed = !current_state;
-        uint16_t event_data = SPIComm::create_macro_key_event(i + 1, pressed);
-
-        // ringBuffer.push(event_data);
-        SPIComm::send_packet(event_data);
-        request_led_blink();
-        fflush(stdout);
-      }
-    }
-
-    // process_buffered_events();
+    process_buffered_events();
 
     if (led_blink_requested)
     {
@@ -145,9 +127,34 @@ void request_led_blink()
   led_blink_requested = true;
 }
 
-void encoder_shared_irq_handler()
+void shared_irq_handler()
 {
   absolute_time_t now = get_absolute_time();
+
+  // Handle macro keys
+  for (int i = 0; i < 5; ++i)
+  {
+    uint key_pin = MACRO_KEYS[i];
+
+    if (gpio_get_irq_event_mask(key_pin) & (GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE))
+    {
+      if (absolute_time_diff_us(last_debounce_time[i], now) > MACRO_KEY_DEBOUNCE_US)
+      {
+        last_debounce_time[i] = now;
+        gpio_acknowledge_irq(key_pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
+
+        bool pressed = !gpio_get(key_pin);
+        prev_state[i] = !pressed;
+
+        uint16_t event_data = SPIComm::create_macro_key_event(i + 1, pressed);
+        if (!SPIComm::queue_packet(event_data))
+        {
+          ringBuffer.push(event_data);
+        }
+        request_led_blink();
+      }
+    }
+  }
 
   // Handle encoder rotation
   if (gpio_get_irq_event_mask(ENCODER_CLK) || gpio_get_irq_event_mask(ENCODER_DT))
@@ -163,6 +170,7 @@ void encoder_shared_irq_handler()
 
       encoder_position += delta;
       encoder_last_state = current_state;
+
       restore_interrupts(status);
 
       if (delta != 0)
@@ -171,10 +179,11 @@ void encoder_shared_irq_handler()
         uint8_t steps = static_cast<uint8_t>(abs(delta));
         uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
 
-        // ringBuffer.push(event_data);
-        SPIComm::send_packet(event_data);
+        if (!SPIComm::queue_packet(event_data))
+        {
+          ringBuffer.push(event_data);
+        }
         request_led_blink();
-        fflush(stdout);
       }
 
       gpio_acknowledge_irq(ENCODER_CLK, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL);
@@ -193,10 +202,11 @@ void encoder_shared_irq_handler()
       bool pressed = !gpio_get(ENCODER_SW);
       uint16_t event_data = SPIComm::create_encoder_switch_event(pressed);
 
-      // ringBuffer.push(event_data);
-      SPIComm::send_packet(event_data);
+      if (!SPIComm::queue_packet(event_data))
+      {
+        ringBuffer.push(event_data);
+      }
       request_led_blink();
-      fflush(stdout);
     }
   }
 }

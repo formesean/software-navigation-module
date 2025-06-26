@@ -25,6 +25,9 @@ private:
   static constexpr uint8_t STATE_PRESSED = 0x01;
   static constexpr uint8_t STATE_RELEASED = 0x00;
 
+  static volatile uint16_t tx_data;
+  static volatile bool data_ready;
+
   static inline uint8_t compute_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
     return type ^ action ^ value;
@@ -38,6 +41,26 @@ private:
            (checksum & 0x0F);
   }
 
+  static void spi_slave_irq_handler()
+  {
+    spi_get_hw(spi1)->icr = SPI_SSPICR_RTIC_BITS | SPI_SSPICR_RORIC_BITS;
+
+    if (spi_is_readable(spi1))
+    {
+      uint16_t dummy = spi_get_hw(spi1)->dr;
+
+      if (data_ready)
+      {
+        spi_get_hw(spi1)->dr = tx_data;
+        data_ready = false;
+      }
+      else
+      {
+        spi_get_hw(spi1)->dr = 0x0000;
+      }
+    }
+  }
+
 public:
   static void init_slave()
   {
@@ -49,6 +72,21 @@ public:
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
+
+    spi_get_hw(spi1)->imsc = SPI_SSPIMSC_RXIM_BITS;
+    irq_set_exclusive_handler(SPI1_IRQ, spi_slave_irq_handler);
+    irq_set_enabled(SPI1_IRQ, true);
+  }
+
+  static bool queue_packet(uint16_t packet)
+  {
+    if (!data_ready)
+    {
+      tx_data = packet;
+      data_ready = true;
+      return true;
+    }
+    return false;
   }
 
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
@@ -83,12 +121,14 @@ public:
 
     if (result == 1)
     {
-      // printf("Packet sent: 0x%04X\n", tx_buffer);
       return true;
     }
     return false;
   }
 };
+
+volatile uint16_t SPIComm::tx_data = 0;
+volatile bool SPIComm::data_ready = false;
 
 #endif
 
