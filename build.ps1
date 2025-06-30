@@ -1,30 +1,30 @@
-# PowerShell script to clean, configure, and build a CMake project using MinGW
+# PowerShell script to configure and build a CMake project using MinGW
 
-# Remove the existing build directory if it exists
-if (Test-Path "build") {
-    Remove-Item -Recurse -Force "build"
-    Write-Host "Old build directory removed."
+# Create build directory if it doesn't exist
+if (-Not (Test-Path "build")) {
+    New-Item -ItemType Directory -Path "build" | Out-Null
+    Write-Host "Created build directory."
 }
 
-# Create a new build directory
-New-Item -ItemType Directory -Path "build" | Out-Null
 Set-Location "build"
 
-# Run CMake to configure the project with MinGW
-Write-Host "Configuring project with CMake..."
-cmake -G "MinGW Makefiles" ..
-
-# Check if CMake succeeded
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "CMake configuration failed!" -ForegroundColor Red
-    exit $LASTEXITCODE
+# Configure only if Makefile doesn't exist (i.e., first time or manually deleted)
+if (-Not (Test-Path "Makefile")) {
+    Write-Host "Running CMake to configure project..."
+    cmake -G "MinGW Makefiles" ..
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "CMake configuration failed!" -ForegroundColor Red
+        exit $LASTEXITCODE
+    }
+}
+else {
+    Write-Host "Makefile found — skipping CMake configuration."
 }
 
-# Build the project using MinGW Make
+# Build using MinGW Make
 Write-Host "Building project with MinGW32-make..."
 mingw32-make
 
-# Check if the build succeeded
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -32,4 +32,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Set-Location ..
 
-Write-Host "Build completed successfully!" -ForegroundColor Green
+Write-Host "✅ Build completed successfully!" -ForegroundColor Green

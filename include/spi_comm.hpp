@@ -121,6 +121,7 @@ public:
 
     if (result == 1)
     {
+      printf("Packet sent: 0x%04X\n", tx_buffer);
       return true;
     }
     return false;

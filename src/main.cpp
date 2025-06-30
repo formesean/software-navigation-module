@@ -24,9 +24,9 @@ volatile int32_t encoder_position = 0;
 volatile uint8_t encoder_last_state = 0;
 
 // Timing constants
-const uint32_t ENCODER_DEBOUNCE_US = 1000;
-const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
-const uint32_t MACRO_KEY_DEBOUNCE_US = 20000;
+const uint32_t ENCODER_DEBOUNCE_US = 500;
+const uint32_t ENCODER_SW_DEBOUNCE_US = 10000;
+const uint32_t MACRO_KEY_DEBOUNCE_US = 10000;
 
 // Encoder state transition table
 const int8_t encoder_transition_table[16] = {
@@ -77,11 +77,11 @@ int main()
     {
       led_blink_requested = false;
       gpio_put(LED_PIN, 1);
-      sleep_ms(50);
+      busy_wait_us(50000);
       gpio_put(LED_PIN, 0);
     }
 
-    tight_loop_contents();
+    __wfi();
   }
 
   return 0;
@@ -143,15 +143,19 @@ void shared_irq_handler()
         last_debounce_time[i] = now;
         gpio_acknowledge_irq(key_pin, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
 
-        bool pressed = !gpio_get(key_pin);
-        prev_state[i] = !pressed;
+        bool current_pressed = !gpio_get(key_pin);
 
-        uint16_t event_data = SPIComm::create_macro_key_event(i + 1, pressed);
-        if (!SPIComm::queue_packet(event_data))
+        if (current_pressed != prev_state[i])
         {
-          ringBuffer.push(event_data);
+          prev_state[i] = current_pressed;
+
+          uint16_t event_data = SPIComm::create_macro_key_event(i + 1, current_pressed);
+          if (!SPIComm::queue_packet(event_data))
+          {
+            ringBuffer.push(event_data);
+          }
+          request_led_blink();
         }
-        request_led_blink();
       }
     }
   }
@@ -162,11 +166,11 @@ void shared_irq_handler()
     if (absolute_time_diff_us(last_encoder_event, now) > ENCODER_DEBOUNCE_US)
     {
       last_encoder_event = now;
-      uint32_t status = save_and_disable_interrupts();
 
-      uint8_t current_state = (gpio_get(ENCODER_DT) << 1) | gpio_get(ENCODER_CLK);
-      uint8_t index = (encoder_last_state << 2) | current_state;
-      int8_t delta = encoder_transition_table[index & 0x0F];
+      uint32_t status = save_and_disable_interrupts();
+      uint8_t current_state = (gpio_get(ENCODER_CLK) << 1) | gpio_get(ENCODER_DT);
+      uint8_t transition_index = (encoder_last_state << 2) | current_state;
+      int8_t delta = encoder_transition_table[transition_index & 0x0F];
 
       encoder_position += delta;
       encoder_last_state = current_state;
@@ -177,8 +181,8 @@ void shared_irq_handler()
       {
         bool clockwise = delta > 0;
         uint8_t steps = static_cast<uint8_t>(abs(delta));
-        uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
 
+        uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise);
         if (!SPIComm::queue_packet(event_data))
         {
           ringBuffer.push(event_data);
@@ -199,9 +203,9 @@ void shared_irq_handler()
       last_encoder_button_event = now;
       gpio_acknowledge_irq(ENCODER_SW, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE);
 
-      bool pressed = !gpio_get(ENCODER_SW);
-      uint16_t event_data = SPIComm::create_encoder_switch_event(pressed);
+      bool current_pressed = !gpio_get(ENCODER_SW);
 
+      uint16_t event_data = SPIComm::create_encoder_switch_event(current_pressed);
       if (!SPIComm::queue_packet(event_data))
       {
         ringBuffer.push(event_data);

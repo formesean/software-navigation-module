@@ -4,18 +4,18 @@
 #include <stdint.h>
 #include <cstddef>
 
-constexpr size_t BUFFER_SIZE = 32;
+constexpr size_t BUFFER_SIZE = 64;
 
 class RingBuffer
 {
 private:
-  uint16_t buffer[BUFFER_SIZE];
-  volatile int head = 0;
-  volatile int tail = 0;
-  volatile int count = 0;
+  alignas(16) uint16_t buffer[BUFFER_SIZE];
+  volatile uint32_t head = 0;
+  volatile uint32_t tail = 0;
+  volatile uint32_t count = 0;
 
 public:
-  inline bool push(uint16_t event_data)
+  inline bool push(uint16_t event_data) noexcept
   {
     uint32_t status = save_and_disable_interrupts();
 
@@ -26,14 +26,14 @@ public:
     }
 
     buffer[head] = event_data;
-    head = (head + 1) % BUFFER_SIZE;
+    head = (head + 1) & (BUFFER_SIZE - 1);
     ++count;
 
     restore_interrupts(status);
     return true;
   }
 
-  inline bool pop(uint16_t &out)
+  inline bool pop(uint16_t &out) noexcept
   {
     uint32_t status = save_and_disable_interrupts();
 
@@ -44,38 +44,23 @@ public:
     }
 
     out = buffer[tail];
-    tail = (tail + 1) % BUFFER_SIZE;
+    tail = (tail + 1) & (BUFFER_SIZE - 1);
     --count;
 
     restore_interrupts(status);
     return true;
   }
 
-  inline bool is_empty() const
-  {
-    return count == 0;
-  }
+  inline bool is_empty() const noexcept { return count == 0; }
+  inline bool is_full() const noexcept { return count == BUFFER_SIZE; }
+  inline size_t size() const noexcept { return count; }
+  inline uint8_t utilization_percent() const noexcept { return (count * 100) / BUFFER_SIZE; }
 
-  inline bool is_full() const
-  {
-    return count == BUFFER_SIZE;
-  }
-
-  inline size_t size() const
-  {
-    return count;
-  }
-
-  inline void clear()
+  inline void clear() noexcept
   {
     uint32_t status = save_and_disable_interrupts();
     head = tail = count = 0;
     restore_interrupts(status);
-  }
-
-  inline uint8_t utilization_percent() const
-  {
-    return (count * 100) / BUFFER_SIZE;
   }
 };
 
