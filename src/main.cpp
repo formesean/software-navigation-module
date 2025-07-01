@@ -30,8 +30,8 @@ const uint32_t MACRO_KEY_DEBOUNCE_US = 10000;
 
 // Encoder state transition table
 const int8_t encoder_transition_table[16] = {
-    0, 1, -1, 0, -1, 0, 0, 1,
-    1, 0, 0, -1, 0, -1, 1, 0};
+    0, -1, 1, 0, 1, 0, 0, -1,
+    -1, 0, 0, 1, 0, 1, -1, 0};
 
 absolute_time_t last_encoder_event;
 absolute_time_t last_encoder_button_event;
@@ -49,6 +49,7 @@ void process_buffered_events();
 int main()
 {
   stdio_init_all();
+  wait_for_usb_connect();
   setup_pins();
   SPIComm::init_slave();
 
@@ -182,7 +183,7 @@ void shared_irq_handler()
         bool clockwise = delta > 0;
         uint8_t steps = static_cast<uint8_t>(abs(delta));
 
-        uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise);
+        uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
         if (!SPIComm::queue_packet(event_data))
         {
           ringBuffer.push(event_data);

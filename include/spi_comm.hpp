@@ -49,6 +49,7 @@ private:
     {
       uint16_t dummy = spi_get_hw(spi1)->dr;
 
+      uint32_t status = save_and_disable_interrupts();
       if (data_ready)
       {
         spi_get_hw(spi1)->dr = tx_data;
@@ -56,8 +57,9 @@ private:
       }
       else
       {
-        spi_get_hw(spi1)->dr = 0x0000;
+        spi_get_hw(spi1)->dr = 0xFFFF;
       }
+      restore_interrupts(status);
     }
   }
 
@@ -80,12 +82,15 @@ public:
 
   static bool queue_packet(uint16_t packet)
   {
+    uint32_t status = save_and_disable_interrupts();
     if (!data_ready)
     {
       tx_data = packet;
       data_ready = true;
+      restore_interrupts(status);
       return true;
     }
+    restore_interrupts(status);
     return false;
   }
 
