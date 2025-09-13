@@ -5,6 +5,7 @@
 #include <hardware/spi.h>
 #include <hardware/sync.h>
 #include <cstdint>
+#include <stdio.h>
 
 class SPIComm
 {
@@ -53,8 +54,14 @@ private:
 
     if (spi_is_readable(spi1))
     {
-      volatile uint16_t dummy = spi_get_hw(spi1)->dr;
-      (void)dummy;
+      volatile uint16_t rx_word = spi_get_hw(spi1)->dr;
+      uint8_t rx_high_byte = (rx_word >> 8) & 0xFF;
+      uint8_t rx_low_byte = rx_word & 0xFF;
+
+      if (rx_high_byte != 0x00 && rx_low_byte != 0x00)
+      {
+        printf("Received: 0x%04X (bytes: 0x%02X 0x%02X)\n", rx_word, rx_high_byte, rx_low_byte);
+      }
 
       if (data_ready && !transmission_in_progress)
       {
@@ -157,7 +164,12 @@ public:
 
     if (result == 1)
     {
-      printf("Packet sent: 0x%04X\n", tx_buffer);
+      uint8_t tx_high_byte = (tx_buffer >> 8) & 0xFF;
+      uint8_t tx_low_byte = tx_buffer & 0xFF;
+      uint8_t rx_high_byte = (rx_buffer >> 8) & 0xFF;
+      uint8_t rx_low_byte = rx_buffer & 0xFF;
+      printf("Packet Sent: 0x%04X (bytes: 0x%02X 0x%02X) | Received: 0x%04X (bytes: 0x%02X 0x%02X)\n",
+             tx_buffer, tx_high_byte, tx_low_byte, rx_buffer, rx_high_byte, rx_low_byte);
       return true;
     }
     return false;
