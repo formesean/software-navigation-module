@@ -3,6 +3,7 @@
 
 #include <pico/stdlib.h>
 #include <hardware/spi.h>
+#include <hardware/sync.h>
 #include <cstdint>
 
 class SPIComm
@@ -27,6 +28,8 @@ private:
 
   static volatile uint16_t tx_data;
   static volatile bool data_ready;
+  static volatile bool transmission_in_progress;
+  static volatile absolute_time_t last_transmission_time;
 
   static inline uint8_t compute_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
@@ -43,24 +46,30 @@ private:
 
   static void spi_slave_irq_handler()
   {
+    uint32_t status = save_and_disable_interrupts();
+
+    // Clear all pending interrupts
     spi_get_hw(spi1)->icr = SPI_SSPICR_RTIC_BITS | SPI_SSPICR_RORIC_BITS;
 
     if (spi_is_readable(spi1))
     {
-      uint16_t dummy = spi_get_hw(spi1)->dr;
+      volatile uint16_t dummy = spi_get_hw(spi1)->dr;
+      (void)dummy;
 
-      uint32_t status = save_and_disable_interrupts();
-      if (data_ready)
+      if (data_ready && !transmission_in_progress)
       {
         spi_get_hw(spi1)->dr = tx_data;
         data_ready = false;
+        transmission_in_progress = true;
+        last_transmission_time = get_absolute_time();
       }
       else
       {
-        spi_get_hw(spi1)->dr = 0xFFFF;
+        spi_get_hw(spi1)->dr = 0x0000;
       }
-      restore_interrupts(status);
     }
+
+    restore_interrupts(status);
   }
 
 public:
@@ -75,23 +84,45 @@ public:
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CS, GPIO_FUNC_SPI);
 
+    // Enable receive interrupt only
     spi_get_hw(spi1)->imsc = SPI_SSPIMSC_RXIM_BITS;
     irq_set_exclusive_handler(SPI1_IRQ, spi_slave_irq_handler);
     irq_set_enabled(SPI1_IRQ, true);
+
+    tx_data = 0;
+    data_ready = false;
+    transmission_in_progress = false;
+    last_transmission_time = get_absolute_time();
   }
 
   static bool queue_packet(uint16_t packet)
   {
     uint32_t status = save_and_disable_interrupts();
-    if (!data_ready)
+
+    if (!data_ready && !transmission_in_progress)
     {
       tx_data = packet;
       data_ready = true;
       restore_interrupts(status);
       return true;
     }
+
     restore_interrupts(status);
     return false;
+  }
+
+  static void update_transmission_status()
+  {
+    if (transmission_in_progress)
+    {
+      absolute_time_t now = get_absolute_time();
+      if (absolute_time_diff_us(last_transmission_time, now) > 10000)
+      {
+        uint32_t status = save_and_disable_interrupts();
+        transmission_in_progress = false;
+        restore_interrupts(status);
+      }
+    }
   }
 
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
@@ -131,10 +162,24 @@ public:
     }
     return false;
   }
+
+  static bool is_transmission_ready()
+  {
+    return !data_ready && !transmission_in_progress;
+  }
+
+  static uint8_t get_queue_status()
+  {
+    if (transmission_in_progress) return 2;
+    if (data_ready) return 1;
+    return 0;
+  }
 };
 
 volatile uint16_t SPIComm::tx_data = 0;
 volatile bool SPIComm::data_ready = false;
+volatile bool SPIComm::transmission_in_progress = false;
+volatile absolute_time_t SPIComm::last_transmission_time = 0;
 
 #endif
 

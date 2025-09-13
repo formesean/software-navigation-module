@@ -15,7 +15,7 @@ add_executable(${PROJECT_NAME}
   src/main.cpp
 )
 
-target_link_libraries(${PROJECT_NAME} pico_stdlib hardware_spi hardware_irq hardware_pio)
+target_link_libraries(${PROJECT_NAME} pico_stdlib hardware_spi hardware_irq hardware_pio hardware_pwm hardware_clocks)
 
 pico_enable_stdio_usb(${PROJECT_NAME} 1)
 pico_enable_stdio_uart(${PROJECT_NAME} 0)
