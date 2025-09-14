@@ -28,6 +28,8 @@ volatile bool led_blink_requested = false;
 volatile int32_t encoder_position = 0;
 volatile uint8_t encoder_last_state = 0;
 
+volatile uint16_t g_rx_word = 0;
+
 // Timing constants
 const uint32_t ENCODER_DEBOUNCE_US = 2000;
 const uint32_t ENCODER_SW_DEBOUNCE_US = 25000;
@@ -273,6 +275,24 @@ void process_buffered_events()
 
   SPIComm::update_transmission_status();
 
+  uint16_t rx_snapshot = g_rx_word;
+  if (rx_snapshot != 0)
+  {
+    uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
+    uint8_t rx_low_byte = rx_snapshot & 0xFF;
+    bool send_samples = (rx_high_byte >> 4) == 0x06;
+    if (rx_high_byte != 0x00 && rx_low_byte != 0x00)
+    {
+      printf("Received: 0x%04X (bytes: 0x%02X 0x%02X)\n", rx_snapshot, rx_high_byte, rx_low_byte);
+      g_rx_word = 0;
+
+      if (send_samples)
+      {
+        SPIComm::start_dummy_samples_transfer();
+      }
+    }
+  }
+
   if (absolute_time_diff_us(last_process_time, now) < 1000)
   {
     return;
@@ -288,8 +308,7 @@ void process_buffered_events()
     }
   }
 
-  if (encoder_sw_event_pending &&
-      absolute_time_diff_us(last_encoder_button_event, now) > ENCODER_SW_DEBOUNCE_US)
+  if (encoder_sw_event_pending && absolute_time_diff_us(last_encoder_button_event, now) > ENCODER_SW_DEBOUNCE_US)
   {
     encoder_sw_event_pending = false;
   }
@@ -311,6 +330,28 @@ void process_buffered_events()
     }
 
     sleep_us(500);
+  }
+
+  // Stream dummy samples if active, interleaving with buffered events
+  int streamed = 0;
+  const int max_stream_per_cycle = 4;
+  while (SPIComm::has_dummy_samples_pending() && streamed < max_stream_per_cycle)
+  {
+    uint16_t word;
+    if (!SPIComm::try_get_next_dummy_word(word))
+      break;
+
+    if (SPIComm::queue_packet(word))
+    {
+      streamed++;
+      continue;
+    }
+
+    if (!ringBuffer.push(word))
+    {
+      // Buffer full; stop trying this cycle
+      break;
+    }
   }
 
   static absolute_time_t last_debug_time = 0;

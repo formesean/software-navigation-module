@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <stdio.h>
 
+extern volatile uint16_t g_rx_word;
+
 class SPIComm
 {
 private:
@@ -31,13 +33,62 @@ private:
   static volatile bool data_ready;
   static volatile bool transmission_in_progress;
   static volatile absolute_time_t last_transmission_time;
+  static size_t logan_queue_index;
+  static bool logan_queue_active;
 
-  static inline uint8_t compute_checksum(uint8_t type, uint8_t action, uint8_t value)
+  // Dummy data
+  static constexpr size_t LOGAN_PACKET_SIZE = 127;
+  static inline uint16_t dummy_samples_packet[LOGAN_PACKET_SIZE] = {
+    // header
+    0x0101,
+    // payload: dummy samples 125 16-bit words
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656,    // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
+    0x3434, 0x5656, 0x3434, 0x5656, 0x3434,                                                       // 5  samples
+    // checksum
+    0x0000
+  };
+
+  static inline uint8_t compute_event_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
     return type ^ action ^ value;
   }
 
-  static inline uint16_t pack_to_16bit(uint8_t type, uint8_t action, uint8_t value, uint8_t checksum)
+  static inline uint16_t compute_logan_checksum(const uint16_t* packet, size_t packet_size)
+  {
+    if (packet == nullptr || packet_size < 3)
+    {
+      return 0;
+    }
+
+    uint16_t checksum = 0;
+    for (size_t i = 1; i + 1 < packet_size; ++i)
+    {
+      checksum ^= packet[i];
+    }
+    return checksum;
+  }
+
+  static inline uint16_t compute_logan_checksum(const uint16_t (&packet)[LOGAN_PACKET_SIZE])
+  {
+    uint16_t checksum = 0;
+    for (size_t i = 1; i < LOGAN_PACKET_SIZE - 1; ++i)
+      checksum ^= packet[i];
+
+    return checksum;
+  }
+
+  static inline uint16_t create_event_packet(uint8_t type, uint8_t action, uint8_t value, uint8_t checksum)
   {
     return ((type & 0x0F) << 12) |
            ((action & 0x0F) << 8) |
@@ -54,14 +105,8 @@ private:
 
     if (spi_is_readable(spi1))
     {
-      volatile uint16_t rx_word = spi_get_hw(spi1)->dr;
-      uint8_t rx_high_byte = (rx_word >> 8) & 0xFF;
-      uint8_t rx_low_byte = rx_word & 0xFF;
-
-      if (rx_high_byte != 0x00 && rx_low_byte != 0x00)
-      {
-        printf("Received: 0x%04X (bytes: 0x%02X 0x%02X)\n", rx_word, rx_high_byte, rx_low_byte);
-      }
+      volatile uint16_t rx_word_local = spi_get_hw(spi1)->dr;
+      g_rx_word = rx_word_local;
 
       if (data_ready && !transmission_in_progress)
       {
@@ -135,26 +180,36 @@ public:
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
   {
     uint8_t value = pressed ? STATE_PRESSED : STATE_RELEASED;
-    uint8_t checksum = compute_checksum(EVENT_MACRO_KEY, key_num, value);
+    uint8_t checksum = compute_event_checksum(EVENT_MACRO_KEY, key_num, value);
 
-    return pack_to_16bit(EVENT_MACRO_KEY, key_num, value, checksum);
+    return create_event_packet(EVENT_MACRO_KEY, key_num, value, checksum);
   }
 
   static inline uint16_t create_encoder_rotate_event(bool clockwise, uint8_t steps = 1)
   {
     uint8_t action = clockwise ? ENCODER_CW : ENCODER_CCW;
     uint8_t value = steps & 0x0F;
-    uint8_t checksum = compute_checksum(EVENT_ENCODER_ROTATE, action, value);
+    uint8_t checksum = compute_event_checksum(EVENT_ENCODER_ROTATE, action, value);
 
-    return pack_to_16bit(EVENT_ENCODER_ROTATE, action, value, checksum);
+    return create_event_packet(EVENT_ENCODER_ROTATE, action, value, checksum);
   }
 
   static inline uint16_t create_encoder_switch_event(bool pressed)
   {
     uint8_t value = pressed ? STATE_PRESSED : STATE_RELEASED;
-    uint8_t checksum = compute_checksum(EVENT_ENCODER_SWITCH, ENCODER_BTN, value);
+    uint8_t checksum = compute_event_checksum(EVENT_ENCODER_SWITCH, ENCODER_BTN, value);
 
-    return pack_to_16bit(EVENT_ENCODER_SWITCH, ENCODER_BTN, value, checksum);
+    return create_event_packet(EVENT_ENCODER_SWITCH, ENCODER_BTN, value, checksum);
+  }
+
+  static inline uint16_t create_samples_packet(uint16_t samples)
+  {
+    samples &= 0x0FFF;
+
+    uint8_t checksum = ((samples >> 8) & 0xFF) ^ (samples & 0xFF);
+    checksum &= 0x0F;
+
+    return (samples << 4) | checksum;
   }
 
   static bool send_packet(uint16_t tx_buffer)
@@ -186,12 +241,41 @@ public:
     if (data_ready) return 1;
     return 0;
   }
+
+  static inline void start_dummy_samples_transfer()
+  {
+    if (logan_queue_active)
+      return;
+
+    uint16_t checksum = compute_logan_checksum(dummy_samples_packet);
+    dummy_samples_packet[LOGAN_PACKET_SIZE - 1] = checksum;
+    logan_queue_index = 0;
+    logan_queue_active = true;
+  }
+
+  static inline bool has_dummy_samples_pending()
+  {
+    return logan_queue_active && (logan_queue_index < LOGAN_PACKET_SIZE);
+  }
+
+  static inline bool try_get_next_dummy_word(uint16_t &out)
+  {
+    if (!has_dummy_samples_pending())
+      return false;
+
+    out = dummy_samples_packet[logan_queue_index++];
+    if (logan_queue_index >= LOGAN_PACKET_SIZE)
+      logan_queue_active = false;
+    return true;
+  }
 };
 
 volatile uint16_t SPIComm::tx_data = 0;
 volatile bool SPIComm::data_ready = false;
 volatile bool SPIComm::transmission_in_progress = false;
 volatile absolute_time_t SPIComm::last_transmission_time = 0;
+size_t SPIComm::logan_queue_index = 0;
+bool SPIComm::logan_queue_active = false;
 
 #endif
 
