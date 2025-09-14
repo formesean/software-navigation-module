@@ -332,27 +332,7 @@ void process_buffered_events()
     sleep_us(500);
   }
 
-  // Stream dummy samples if active, interleaving with buffered events
-  int streamed = 0;
-  const int max_stream_per_cycle = 4;
-  while (SPIComm::has_dummy_samples_pending() && streamed < max_stream_per_cycle)
-  {
-    uint16_t word;
-    if (!SPIComm::try_get_next_dummy_word(word))
-      break;
-
-    if (SPIComm::queue_packet(word))
-    {
-      streamed++;
-      continue;
-    }
-
-    if (!ringBuffer.push(word))
-    {
-      // Buffer full; stop trying this cycle
-      break;
-    }
-  }
+  // Dummy samples are now streamed by SPI TX FIFO preloading within SPIComm
 
   static absolute_time_t last_debug_time = 0;
   if (absolute_time_diff_us(last_debug_time, now) > 5000000)

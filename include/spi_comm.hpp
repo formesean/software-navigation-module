@@ -29,10 +29,7 @@ private:
   static constexpr uint8_t STATE_PRESSED = 0x01;
   static constexpr uint8_t STATE_RELEASED = 0x00;
 
-  static volatile uint16_t tx_data;
-  static volatile bool data_ready;
-  static volatile bool transmission_in_progress;
-  static volatile absolute_time_t last_transmission_time;
+  // TX FIFO based streaming state
   static size_t logan_queue_index;
   static bool logan_queue_active;
 
@@ -96,6 +93,29 @@ private:
            (checksum & 0x0F);
   }
 
+  // Helper to check TX FIFO space
+  static inline bool tx_fifo_not_full()
+  {
+    return (spi_get_hw(spi1)->sr & SPI_SSPSR_TNF_BITS) != 0;
+  }
+
+  static inline bool tx_fifo_empty()
+  {
+    return (spi_get_hw(spi1)->sr & SPI_SSPSR_TFE_BITS) != 0;
+  }
+
+  // Fill as many dummy words as possible into TX FIFO
+  static inline void preload_dummy_tx_fifo()
+  {
+    while (tx_fifo_not_full() && has_dummy_samples_pending())
+    {
+      uint16_t word;
+      if (!try_get_next_dummy_word(word))
+        break;
+      spi_get_hw(spi1)->dr = word;
+    }
+  }
+
   static void spi_slave_irq_handler()
   {
     uint32_t status = save_and_disable_interrupts();
@@ -108,17 +128,8 @@ private:
       volatile uint16_t rx_word_local = spi_get_hw(spi1)->dr;
       g_rx_word = rx_word_local;
 
-      if (data_ready && !transmission_in_progress)
-      {
-        spi_get_hw(spi1)->dr = tx_data;
-        data_ready = false;
-        transmission_in_progress = true;
-        last_transmission_time = get_absolute_time();
-      }
-      else
-      {
-        spi_get_hw(spi1)->dr = 0x0000;
-      }
+      // Top-up TX FIFO with any pending dummy samples
+      preload_dummy_tx_fifo();
     }
 
     restore_interrupts(status);
@@ -140,21 +151,16 @@ public:
     spi_get_hw(spi1)->imsc = SPI_SSPIMSC_RXIM_BITS;
     irq_set_exclusive_handler(SPI1_IRQ, spi_slave_irq_handler);
     irq_set_enabled(SPI1_IRQ, true);
-
-    tx_data = 0;
-    data_ready = false;
-    transmission_in_progress = false;
-    last_transmission_time = get_absolute_time();
   }
 
   static bool queue_packet(uint16_t packet)
   {
     uint32_t status = save_and_disable_interrupts();
 
-    if (!data_ready && !transmission_in_progress)
+    // Try to write directly into TX FIFO if space is available
+    if (tx_fifo_not_full())
     {
-      tx_data = packet;
-      data_ready = true;
+      spi_get_hw(spi1)->dr = packet;
       restore_interrupts(status);
       return true;
     }
@@ -163,18 +169,12 @@ public:
     return false;
   }
 
+  // Opportunistically top-up TX FIFO with dummy samples
   static void update_transmission_status()
   {
-    if (transmission_in_progress)
-    {
-      absolute_time_t now = get_absolute_time();
-      if (absolute_time_diff_us(last_transmission_time, now) > 10000)
-      {
-        uint32_t status = save_and_disable_interrupts();
-        transmission_in_progress = false;
-        restore_interrupts(status);
-      }
-    }
+    uint32_t status = save_and_disable_interrupts();
+    preload_dummy_tx_fifo();
+    restore_interrupts(status);
   }
 
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
@@ -232,13 +232,14 @@ public:
 
   static bool is_transmission_ready()
   {
-    return !data_ready && !transmission_in_progress;
+    return tx_fifo_not_full();
   }
 
   static uint8_t get_queue_status()
   {
-    if (transmission_in_progress) return 2;
-    if (data_ready) return 1;
+    // 2: data in FIFO (transmitting/ready), 1: FIFO full, 0: FIFO has space/empty
+    if (!tx_fifo_empty()) return 2;
+    if (!tx_fifo_not_full()) return 1;
     return 0;
   }
 
@@ -251,6 +252,11 @@ public:
     dummy_samples_packet[LOGAN_PACKET_SIZE - 1] = checksum;
     logan_queue_index = 0;
     logan_queue_active = true;
+
+    // Prime TX FIFO immediately
+    uint32_t status = save_and_disable_interrupts();
+    preload_dummy_tx_fifo();
+    restore_interrupts(status);
   }
 
   static inline bool has_dummy_samples_pending()
@@ -270,10 +276,6 @@ public:
   }
 };
 
-volatile uint16_t SPIComm::tx_data = 0;
-volatile bool SPIComm::data_ready = false;
-volatile bool SPIComm::transmission_in_progress = false;
-volatile absolute_time_t SPIComm::last_transmission_time = 0;
 size_t SPIComm::logan_queue_index = 0;
 bool SPIComm::logan_queue_active = false;
 
