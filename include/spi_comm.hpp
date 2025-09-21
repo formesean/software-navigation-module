@@ -77,7 +77,7 @@ private:
   static inline uint16_t generate_sample_word(bool &toggle)
   {
     toggle = !toggle;
-    return toggle ? 0x3434 : 0x5656;
+    return toggle ? 0x0101 : 0x1010;
   }
 
   static inline uint16_t create_event_packet(uint8_t type, uint8_t action, uint8_t value, uint8_t checksum)
