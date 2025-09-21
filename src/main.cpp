@@ -31,9 +31,9 @@ volatile uint8_t encoder_last_state = 0;
 volatile uint16_t g_rx_word = 0;
 
 // Timing constants
-const uint32_t ENCODER_DEBOUNCE_US = 2000;
-const uint32_t ENCODER_SW_DEBOUNCE_US = 25000;
-const uint32_t MACRO_KEY_DEBOUNCE_US = 25000;
+const uint32_t ENCODER_DEBOUNCE_US = 3000;
+const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
+const uint32_t MACRO_KEY_DEBOUNCE_US = 20000;
 
 // Encoder state transition table
 const int8_t encoder_transition_table[16] = {
@@ -280,15 +280,30 @@ void process_buffered_events()
   {
     uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
     uint8_t rx_low_byte = rx_snapshot & 0xFF;
-    bool send_samples = (rx_high_byte >> 4) == 0x06;
+    bool is_logan_cmd = (rx_high_byte >> 4) == 0x06;
     if (rx_high_byte != 0x00 && rx_low_byte != 0x00)
     {
       printf("Received: 0x%04X (bytes: 0x%02X 0x%02X)\n", rx_snapshot, rx_high_byte, rx_low_byte);
       g_rx_word = 0;
 
-      if (send_samples)
+      if (is_logan_cmd)
       {
-        SPIComm::start_dummy_samples_transfer();
+        uint8_t type_nibble = (rx_high_byte >> 4) & 0x0F;   // expect 0x6
+        uint8_t samples_nibble = rx_high_byte & 0x0F;       // 1..A mapping
+        uint8_t rate_nibble = (rx_low_byte >> 4) & 0x0F;    // 1..7 mapping
+        uint8_t rx_checksum = rx_low_byte & 0x0F;
+
+        // Verify checksum matches XOR of the first three nibbles
+        uint8_t calc = (type_nibble ^ samples_nibble ^ rate_nibble) & 0x0F;
+        if (calc == rx_checksum)
+        {
+          SPIComm::configure_dummy_header_from_rx(samples_nibble, rate_nibble);
+          SPIComm::start_dummy_samples_transfer();
+        }
+        else
+        {
+          printf("RX checksum mismatch: calc=0x%X rx=0x%X\n", calc, rx_checksum);
+        }
       }
     }
   }

@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <cstddef>
 
-constexpr size_t BUFFER_SIZE = 64;
+constexpr size_t BUFFER_SIZE = 256;
 
 class RingBuffer
 {

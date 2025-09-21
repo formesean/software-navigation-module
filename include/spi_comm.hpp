@@ -12,7 +12,7 @@ extern volatile uint16_t g_rx_word;
 class SPIComm
 {
 private:
-  static constexpr uint32_t SPI_BAUD = 20000000;
+  static constexpr uint32_t SPI_BAUD = 30000000;
   static constexpr uint8_t PIN_SCK = 10;
   static constexpr uint8_t PIN_MISO = 11;
   static constexpr uint8_t PIN_MOSI = 12;
@@ -33,56 +33,51 @@ private:
   static size_t logan_queue_index;
   static bool logan_queue_active;
 
-  // Dummy data
-  static constexpr size_t LOGAN_PACKET_SIZE = 127;
-  static inline uint16_t dummy_samples_packet[LOGAN_PACKET_SIZE] = {
-    // header
-    0x0101,
-    // payload: dummy samples 125 16-bit words
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656,    // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, 0x3434, 0x5656, // 10 samples
-    0x3434, 0x5656, 0x3434, 0x5656, 0x3434,                                                       // 5  samples
-    // checksum
-    0x0000
-  };
+  // Unified TX transaction queue (events and bulk transfers)
+  enum TxItemType : uint8_t { TX_EVENT = 1, TX_BULK = 2 };
+  static constexpr size_t TXQ_CAPACITY = 64;
+  static uint8_t txq_type[TXQ_CAPACITY];
+  static uint16_t txq_word[TXQ_CAPACITY];
+  static uint32_t txq_head;
+  static uint32_t txq_tail;
+  static uint32_t txq_count;
+  static bool logan_queued; // bulk transfer queued but not yet active
+
+  // Dynamic LOGAN dummy streaming state
+  static uint16_t logan_header_word;        // word[0]
+  static uint16_t logan_checksum_accum;     // XOR over payload
+  static size_t logan_payload_words;        // number of payload sample words
+  static size_t logan_total_words;          // payload + header + checksum
 
   static inline uint8_t compute_event_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
     return type ^ action ^ value;
   }
 
-  static inline uint16_t compute_logan_checksum(const uint16_t* packet, size_t packet_size)
+  // Map samples nibble to number of 16-bit payload sample words
+  static inline size_t map_samples_nibble(uint8_t samples_nibble)
   {
-    if (packet == nullptr || packet_size < 3)
+    switch (samples_nibble & 0x0F)
     {
-      return 0;
+      case 0xA: return 2000;
+      case 0x9: return 1000;
+      case 0x8: return 500;
+      case 0x7: return 200;
+      case 0x6: return 100;
+      case 0x5: return 50;
+      case 0x4: return 20;
+      case 0x3: return 10;
+      case 0x2: return 5;
+      case 0x1: return 2;
+      default:  return 10; // safe default
     }
-
-    uint16_t checksum = 0;
-    for (size_t i = 1; i + 1 < packet_size; ++i)
-    {
-      checksum ^= packet[i];
-    }
-    return checksum;
   }
 
-  static inline uint16_t compute_logan_checksum(const uint16_t (&packet)[LOGAN_PACKET_SIZE])
+  // Simple payload generator: repeat pattern 0x3434, 0x5656
+  static inline uint16_t generate_sample_word(bool &toggle)
   {
-    uint16_t checksum = 0;
-    for (size_t i = 1; i < LOGAN_PACKET_SIZE - 1; ++i)
-      checksum ^= packet[i];
-
-    return checksum;
+    toggle = !toggle;
+    return toggle ? 0x3434 : 0x5656;
   }
 
   static inline uint16_t create_event_packet(uint8_t type, uint8_t action, uint8_t value, uint8_t checksum)
@@ -116,6 +111,68 @@ private:
     }
   }
 
+  // Core implementation: assumes interrupts are disabled by caller
+  static inline void service_tx_fifo_locked()
+  {
+    while (tx_fifo_not_full())
+    {
+      // Continue active bulk first
+      if (logan_queue_active)
+      {
+        preload_dummy_tx_fifo();
+        if (!tx_fifo_not_full()) break;
+        if (has_dummy_samples_pending()) continue;
+        // Bulk finished
+        logan_queue_active = false;
+        continue;
+      }
+
+      if (txq_count == 0)
+      {
+        break;
+      }
+
+      uint8_t item_type = txq_type[txq_tail];
+      if (item_type == TX_EVENT)
+      {
+        uint16_t word = txq_word[txq_tail];
+        txq_tail = (txq_tail + 1) & (TXQ_CAPACITY - 1);
+        --txq_count;
+        if (!tx_fifo_not_full())
+        {
+          txq_tail = (txq_tail + TXQ_CAPACITY - 1) & (TXQ_CAPACITY - 1);
+          ++txq_count;
+          txq_word[txq_tail] = word;
+          txq_type[txq_tail] = TX_EVENT;
+          break;
+        }
+        spi_get_hw(spi1)->dr = word;
+        continue;
+      }
+      else // TX_BULK
+      {
+        txq_tail = (txq_tail + 1) & (TXQ_CAPACITY - 1);
+        --txq_count;
+
+        // start bulk
+        logan_queue_index = 0;
+        logan_queue_active = true;
+        logan_queued = false;
+        preload_dummy_tx_fifo();
+        if (!tx_fifo_not_full()) break;
+        continue;
+      }
+    }
+  }
+
+  // Public-safe wrapper: handles interrupt state internally
+  static inline void service_tx_fifo()
+  {
+    uint32_t status = save_and_disable_interrupts();
+    service_tx_fifo_locked();
+    restore_interrupts(status);
+  }
+
   static void spi_slave_irq_handler()
   {
     uint32_t status = save_and_disable_interrupts();
@@ -127,9 +184,8 @@ private:
     {
       volatile uint16_t rx_word_local = spi_get_hw(spi1)->dr;
       g_rx_word = rx_word_local;
-
-      // Top-up TX FIFO with any pending dummy samples
-      preload_dummy_tx_fifo();
+      // Service TX FIFO with queued transactions (interrupts already disabled)
+      service_tx_fifo_locked();
     }
 
     restore_interrupts(status);
@@ -157,11 +213,24 @@ public:
   {
     uint32_t status = save_and_disable_interrupts();
 
-    // Try to write directly into TX FIFO if space is available
-    if (tx_fifo_not_full())
+    // Fast-path: direct write only if absolutely no sequencing pending
+    if (!logan_queue_active && txq_count == 0 && tx_fifo_not_full())
     {
       spi_get_hw(spi1)->dr = packet;
       restore_interrupts(status);
+      return true;
+    }
+
+    // Enqueue as an event transaction
+    if (txq_count < TXQ_CAPACITY)
+    {
+      txq_type[txq_head] = TX_EVENT;
+      txq_word[txq_head] = packet;
+      txq_head = (txq_head + 1) & (TXQ_CAPACITY - 1);
+      ++txq_count;
+      restore_interrupts(status);
+      // Try to kick the TX engine
+      service_tx_fifo();
       return true;
     }
 
@@ -172,9 +241,7 @@ public:
   // Opportunistically top-up TX FIFO with dummy samples
   static void update_transmission_status()
   {
-    uint32_t status = save_and_disable_interrupts();
-    preload_dummy_tx_fifo();
-    restore_interrupts(status);
+    service_tx_fifo();
   }
 
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
@@ -212,6 +279,25 @@ public:
     return (samples << 4) | checksum;
   }
 
+  // Configure dynamic LOGAN stream based on RX nibbles.
+  // Sets header word and payload length; checksum is accumulated on the fly.
+  static inline void configure_dummy_header_from_rx(uint8_t samples_nibble, uint8_t rate_nibble)
+  {
+    uint8_t type = 0x06;
+    uint8_t action = samples_nibble & 0x0F;
+    uint8_t value = rate_nibble & 0x0F;
+    uint8_t checksum = compute_event_checksum(type, action, value) & 0x0F;
+
+    logan_header_word = ((type & 0x0F) << 12) |
+                        ((action & 0x0F) << 8) |
+                        ((value & 0x0F) << 4) |
+                        (checksum & 0x0F);
+
+    logan_payload_words = map_samples_nibble(samples_nibble);
+    logan_total_words = 1 /*header*/ + logan_payload_words + 1 /*checksum*/;
+    logan_checksum_accum = 0;
+  }
+
   static bool send_packet(uint16_t tx_buffer)
   {
     uint16_t rx_buffer = 0;
@@ -245,23 +331,28 @@ public:
 
   static inline void start_dummy_samples_transfer()
   {
-    if (logan_queue_active)
+    // Avoid duplicate scheduling
+    if (logan_queue_active || logan_queued)
       return;
 
-    uint16_t checksum = compute_logan_checksum(dummy_samples_packet);
-    dummy_samples_packet[LOGAN_PACKET_SIZE - 1] = checksum;
-    logan_queue_index = 0;
-    logan_queue_active = true;
-
-    // Prime TX FIFO immediately
     uint32_t status = save_and_disable_interrupts();
-    preload_dummy_tx_fifo();
+    if (txq_count < TXQ_CAPACITY)
+    {
+      txq_type[txq_head] = TX_BULK;
+      txq_word[txq_head] = 0;
+      txq_head = (txq_head + 1) & (TXQ_CAPACITY - 1);
+      ++txq_count;
+      logan_queued = true;
+      restore_interrupts(status);
+      service_tx_fifo();
+      return;
+    }
     restore_interrupts(status);
   }
 
   static inline bool has_dummy_samples_pending()
   {
-    return logan_queue_active && (logan_queue_index < LOGAN_PACKET_SIZE);
+    return logan_queue_active && (logan_queue_index < logan_total_words);
   }
 
   static inline bool try_get_next_dummy_word(uint16_t &out)
@@ -269,15 +360,47 @@ public:
     if (!has_dummy_samples_pending())
       return false;
 
-    out = dummy_samples_packet[logan_queue_index++];
-    if (logan_queue_index >= LOGAN_PACKET_SIZE)
+    // index 0: header
+    if (logan_queue_index == 0)
+    {
+      out = logan_header_word;
+      logan_queue_index++;
+      return true;
+    }
+
+    // last index: checksum word
+    if (logan_queue_index == (logan_total_words - 1))
+    {
+      out = logan_checksum_accum;
+      logan_queue_index++;
       logan_queue_active = false;
+      return true;
+    }
+
+    // payload sample
+    static bool toggle = false;
+    uint16_t sample = generate_sample_word(toggle);
+    logan_checksum_accum ^= sample;
+    out = sample;
+    logan_queue_index++;
     return true;
   }
 };
 
 size_t SPIComm::logan_queue_index = 0;
 bool SPIComm::logan_queue_active = false;
+uint8_t SPIComm::txq_type[SPIComm::TXQ_CAPACITY] = {};
+uint16_t SPIComm::txq_word[SPIComm::TXQ_CAPACITY] = {};
+uint32_t SPIComm::txq_head = 0;
+uint32_t SPIComm::txq_tail = 0;
+uint32_t SPIComm::txq_count = 0;
+bool SPIComm::logan_queued = false;
+
+// Dynamic LOGAN streaming state definitions
+uint16_t SPIComm::logan_header_word = 0;
+uint16_t SPIComm::logan_checksum_accum = 0;
+size_t SPIComm::logan_payload_words = 0;
+size_t SPIComm::logan_total_words = 0;
 
 #endif
 
