@@ -8,6 +8,8 @@
 #include <stdio.h>
 
 extern volatile uint16_t g_rx_word;
+extern volatile bool g_stop_requested;
+extern volatile bool g_start_requested;
 
 class SPIComm
 {
@@ -17,6 +19,9 @@ private:
   static constexpr uint8_t PIN_MISO = 11;
   static constexpr uint8_t PIN_MOSI = 12;
   static constexpr uint8_t PIN_CS = 13;
+
+  static constexpr uint16_t CMD_START = 0xA11A;
+  static constexpr uint16_t CMD_STOP  = 0xA10B;
 
   static constexpr uint8_t EVENT_MACRO_KEY = 0x01;
   static constexpr uint8_t EVENT_ENCODER_ROTATE = 0x02;
@@ -49,6 +54,10 @@ private:
   static size_t logan_payload_words;        // number of payload sample words
   static size_t logan_total_words;          // payload + header + checksum
 
+  // LOGAN payload storage (filled externally before transmission)
+  static constexpr size_t LOGAN_MAX_SAMPLES = 2000;
+  static uint16_t logan_payload_storage[LOGAN_MAX_SAMPLES];
+
   static inline uint8_t compute_event_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
     return type ^ action ^ value;
@@ -69,7 +78,22 @@ private:
       case 0x3: return 10;
       case 0x2: return 5;
       case 0x1: return 2;
-      default:  return 10; // safe default
+      default:  return 500;
+    }
+  }
+
+  static inline size_t map_sampling_rate_nibble(uint8_t sampling_rate_nibble)
+  {
+    switch (sampling_rate_nibble & 0x0F)
+    {
+      case 0x7: return 100;
+      case 0x6: return 50;
+      case 0x5: return 20;
+      case 0x4: return 10;
+      case 0x3: return 5;
+      case 0x2: return 2;
+      case 0x1: return 1;
+      default:  return 50;
     }
   }
 
@@ -180,13 +204,25 @@ private:
     // Clear all pending interrupts
     spi_get_hw(spi1)->icr = SPI_SSPICR_RTIC_BITS | SPI_SSPICR_RORIC_BITS;
 
-    if (spi_is_readable(spi1))
+    bool stop_seen = false;
+    bool start_seen = false;
+    uint16_t last_non_control = 0;
+
+    while (spi_is_readable(spi1))
     {
-      volatile uint16_t rx_word_local = spi_get_hw(spi1)->dr;
-      g_rx_word = rx_word_local;
-      // Service TX FIFO with queued transactions (interrupts already disabled)
-      service_tx_fifo_locked();
+      uint16_t w = spi_get_hw(spi1)->dr;
+      if (w == CMD_STOP) { stop_seen = true; continue; }
+      if (w == CMD_START) { start_seen = true; continue; }
+      last_non_control = w;
     }
+
+    // Latch control commands as flags; do not publish them into g_rx_word
+    if (stop_seen) g_stop_requested = true;
+    if (start_seen) g_start_requested = true;
+    if (last_non_control != 0 && g_rx_word == 0) g_rx_word = last_non_control;
+
+    // Service TX FIFO with queued transactions (interrupts already disabled)
+    service_tx_fifo_locked();
 
     restore_interrupts(status);
   }
@@ -309,8 +345,6 @@ public:
       uint8_t tx_low_byte = tx_buffer & 0xFF;
       uint8_t rx_high_byte = (rx_buffer >> 8) & 0xFF;
       uint8_t rx_low_byte = rx_buffer & 0xFF;
-      printf("Packet Sent: 0x%04X (bytes: 0x%02X 0x%02X) | Received: 0x%04X (bytes: 0x%02X 0x%02X)\n",
-             tx_buffer, tx_high_byte, tx_low_byte, rx_buffer, rx_high_byte, rx_low_byte);
       return true;
     }
     return false;
@@ -350,6 +384,33 @@ public:
     restore_interrupts(status);
   }
 
+  static inline void reset_state()
+  {
+    uint32_t status = save_and_disable_interrupts();
+    // Disable SPI IRQ to prevent ISR during reset
+    irq_set_enabled(SPI1_IRQ, false);
+
+    // Deinit peripheral to clear FIFOs, then re-init fresh
+    spi_deinit(spi1);
+
+    // Clear software queues/state
+    txq_head = 0;
+    txq_tail = 0;
+    txq_count = 0;
+    logan_queue_index = 0;
+    logan_queue_active = false;
+    logan_queued = false;
+    logan_header_word = 0;
+    logan_checksum_accum = 0;
+    logan_payload_words = 0;
+    logan_total_words = 0;
+
+    restore_interrupts(status);
+
+    // Re-initialize SPI slave and ISR; leaves clean TX/RX FIFOs
+    init_slave();
+  }
+
   static inline bool has_dummy_samples_pending()
   {
     return logan_queue_active && (logan_queue_index < logan_total_words);
@@ -378,12 +439,48 @@ public:
     }
 
     // payload sample
-    static bool toggle = false;
-    uint16_t sample = generate_sample_word(toggle);
+    size_t payload_index = logan_queue_index - 1;
+    uint16_t sample = 0;
+    if (payload_index < logan_payload_words)
+    {
+      sample = logan_payload_storage[payload_index];
+    }
     logan_checksum_accum ^= sample;
     out = sample;
     logan_queue_index++;
     return true;
+  }
+
+  // Provide accessors to mapping for external configuration
+  static inline size_t samples_from_nibble(uint8_t samples_nibble)
+  {
+    return map_samples_nibble(samples_nibble);
+  }
+
+  static inline size_t rate_from_nibble(uint8_t rate_nibble)
+  {
+    return map_sampling_rate_nibble(rate_nibble);
+  }
+
+  // Copy sampled payload into internal storage to be streamed
+  static inline void set_logan_payload(const uint16_t *data, size_t count)
+  {
+    if (count > logan_payload_words) count = logan_payload_words;
+    if (count > LOGAN_MAX_SAMPLES) count = LOGAN_MAX_SAMPLES;
+    for (size_t i = 0; i < count; ++i)
+    {
+      logan_payload_storage[i] = data[i];
+    }
+  }
+
+  // Directly configure header and payload length (for multi-channel custom headers)
+  static inline void configure_custom_header(uint16_t header_word, size_t payload_words)
+  {
+    logan_header_word = header_word;
+    logan_payload_words = payload_words;
+    if (logan_payload_words > LOGAN_MAX_SAMPLES) logan_payload_words = LOGAN_MAX_SAMPLES;
+    logan_total_words = 1 /*header*/ + logan_payload_words + 1 /*checksum*/;
+    logan_checksum_accum = 0;
   }
 };
 
@@ -401,6 +498,7 @@ uint16_t SPIComm::logan_header_word = 0;
 uint16_t SPIComm::logan_checksum_accum = 0;
 size_t SPIComm::logan_payload_words = 0;
 size_t SPIComm::logan_total_words = 0;
+uint16_t SPIComm::logan_payload_storage[SPIComm::LOGAN_MAX_SAMPLES] = {};
 
 #endif
 
