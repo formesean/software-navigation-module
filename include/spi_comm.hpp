@@ -228,6 +228,12 @@ private:
   }
 
 public:
+  // Returns true if a LOGAN bulk transfer is queued or currently active
+  static inline bool is_logan_transfer_busy()
+  {
+    return logan_queue_active || logan_queued;
+  }
+
   static void init_slave()
   {
     spi_init(spi1, SPI_BAUD);

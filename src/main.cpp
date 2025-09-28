@@ -78,6 +78,7 @@ static volatile size_t g_logan_sample_index = 0;
 static uint16_t g_logan_sample_buffer[2000];
 static volatile uint8_t g_logan_samples_nibble = 0;
 static volatile uint8_t g_logan_rate_nibble = 0;
+static volatile bool g_logan_continuous = false;
 
 // Pack raw 1-bit samples (stored as 0/1) into 16-bit words per nibble rules
 // First word contains remainder (N % 4) samples in low nibbles, then full words of 4 samples
@@ -266,6 +267,7 @@ void reset_system_state()
   g_logan_sample_target = 0;
   g_logan_samples_nibble = 0;
   g_logan_rate_nibble = 0;
+  g_logan_continuous = false;
   cancel_repeating_timer(&g_logan_timer);
 }
 
@@ -418,52 +420,67 @@ void process_buffered_events()
   uint16_t rx_snapshot = g_rx_word;
   if (rx_snapshot != 0)
   {
-    // Do not consume STOP/ENABLE here; leave for main loop
-    if (rx_snapshot == STOP_CMD || rx_snapshot == START_CMD)
+    if (rx_snapshot == STOP_CMD)
     {
-
+      g_stop_requested = true;
+      g_rx_word = 0; // consume
+      return;
+    }
+    else if (rx_snapshot == START_CMD)
+    {
+      g_start_requested = true;
+      g_rx_word = 0; // consume
     }
     else
     {
       uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
-      uint8_t rx_low_byte = rx_snapshot & 0xFF;
-      bool is_logan_cmd = (rx_high_byte >> 4) == 0x06;
+      uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
 
-      if (rx_high_byte != 0x00 && rx_low_byte != 0x00)
+      bool is_logan_cmd = ((rx_high_byte >> 4) == 0x06);
+      if (is_logan_cmd && rx_high_byte != 0x00 && rx_low_byte != 0x00)
       {
-        if (is_logan_cmd)
-        {
-          uint8_t type_nibble = (rx_high_byte >> 4) & 0x0F;   // expect 0x6
-          uint8_t samples_nibble = rx_high_byte & 0x0F;       // 1..A mapping
-          uint8_t rate_nibble = (rx_low_byte >> 4) & 0x0F;    // 1..7 mapping
-          uint8_t rx_checksum = rx_low_byte & 0x0F;
+        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // 0x6
+        uint8_t samples_nibble =  rx_high_byte       & 0x0F;
+        uint8_t rate_nibble    = (rx_low_byte  >> 4) & 0x0F;
+        uint8_t rx_checksum    =  rx_low_byte        & 0x0F;
 
-          // Verify checksum matches XOR of the first three nibbles
-          uint8_t calc = (type_nibble ^ samples_nibble ^ rate_nibble) & 0x0F;
-          if (calc == rx_checksum)
+        uint8_t calc = (type_nibble ^ samples_nibble ^ rate_nibble) & 0x0F;
+        if (calc == rx_checksum)
+        {
+          if (samples_nibble == 0x0 && rate_nibble == 0x0)
           {
-            // Map to count and rate, then start timer-based sampling
+            // LOGAN STOP
+            g_logan_continuous = false;
+            g_logan_sampling_active = false;
+            cancel_repeating_timer(&g_logan_timer);
+            printf("LOGAN STOP received; continuous disabled\r\n");
+            g_rx_word = 0; // consume
+          }
+          else
+          {
+            // LOGAN START / (re-)arm
             size_t sample_count = SPIComm::samples_from_nibble(samples_nibble);
-            size_t rate_khz = SPIComm::rate_from_nibble(rate_nibble);
+            size_t rate_khz     = SPIComm::rate_from_nibble(rate_nibble);
             if (rate_khz == 0) rate_khz = 1;
-            int64_t interval_us = static_cast<int64_t>(1000 / rate_khz); // kHz -> us (1kHz => 1000us)
+            int64_t interval_us = (int64_t)(1000 / rate_khz);
             if (interval_us <= 0) interval_us = 1;
 
-            // Cancel any prior timer before re-arming
             cancel_repeating_timer(&g_logan_timer);
 
             g_logan_samples_nibble = samples_nibble;
-            g_logan_rate_nibble = rate_nibble;
-            g_logan_sample_target = sample_count;
-            g_logan_sample_index = 0;
-            g_logan_sampling_done = false;
+            g_logan_rate_nibble    = rate_nibble;
+            g_logan_sample_target  = sample_count;
+            g_logan_sample_index   = 0;
+            g_logan_sampling_done  = false;
             g_logan_sampling_active = true;
+            g_logan_continuous      = true; // until explicit LOGAN STOP
 
-            // Schedule repeating timer callback periodically (negative interval typical in Pico SDK)
             add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
 
-            // Consume RX command now that sampling has been armed
-            g_rx_word = 0;
+            printf("LOGAN ARM: samples=%u rate_khz=%u interval_us=%lld continuous=1\r\n",
+                   (unsigned)sample_count, (unsigned)rate_khz, (long long)interval_us);
+
+            g_rx_word = 0; // consume
           }
         }
       }
@@ -512,43 +529,70 @@ void process_buffered_events()
   // If LOGAN sampling finished, prepare payload and start transfer
   if (g_logan_sampling_done)
   {
-    g_logan_sampling_done = false;
-    // Pack raw 0/1 samples into nibble-packed 16-bit words
-    uint16_t packed_words[600]; // supports up to 2000 samples => 500 words, margin added
-    size_t packed_count = pack_samples_to_words(g_logan_sample_buffer, g_logan_sample_index, packed_words, 600);
-
-    // Build header from nibbles
-    uint8_t samples_nib = g_logan_samples_nibble;
-    uint8_t rate_nib = g_logan_rate_nibble;
-    uint8_t type_nib = 0x06;
-    uint8_t hdr_csum = (type_nib ^ (samples_nib & 0x0F) ^ (rate_nib & 0x0F)) & 0x0F;
-    uint16_t header_word = ((type_nib & 0x0F) << 12) |
-                           ((samples_nib & 0x0F) << 8) |
-                           ((rate_nib & 0x0F) << 4) |
-                           (hdr_csum & 0x0F);
-
-    // Configure custom header with correct payload size in words
-    SPIComm::configure_custom_header(header_word, packed_count);
-
-    // Compute checksum across packed payload
-    uint16_t payload_checksum = 0;
-    for (size_t i = 0; i < packed_count; ++i)
+    // Only package and send when the previous bulk is not busy
+    if (!SPIComm::is_logan_transfer_busy())
     {
-      payload_checksum ^= packed_words[i];
-    }
+      g_logan_sampling_done = false;
 
-    // Print formatted packet to serial monitor
-    printf("LOGAN HEADER: 0x%04X\r\n", header_word);
-    printf("LOGAN PAYLOAD (%u words for %u samples):\r\n", (unsigned)packed_count, (unsigned)g_logan_sample_index);
-    for (size_t i = 0; i < packed_count; ++i)
+      // Pack raw 0/1 samples into nibble-packed 16-bit words
+      uint16_t packed_words[600]; // supports up to 2000 samples => 500 words, margin added
+      size_t packed_count = pack_samples_to_words(g_logan_sample_buffer, g_logan_sample_index, packed_words, 600);
+
+      // Build header from nibbles
+      uint8_t samples_nib = g_logan_samples_nibble;
+      uint8_t rate_nib = g_logan_rate_nibble;
+      uint8_t type_nib = 0x06;
+      uint8_t hdr_csum = (type_nib ^ (samples_nib & 0x0F) ^ (rate_nib & 0x0F)) & 0x0F;
+      uint16_t header_word = ((type_nib & 0x0F) << 12) |
+                             ((samples_nib & 0x0F) << 8) |
+                             ((rate_nib & 0x0F) << 4) |
+                             (hdr_csum & 0x0F);
+
+      // Configure custom header with correct payload size in words
+      SPIComm::configure_custom_header(header_word, packed_count);
+
+      // Compute checksum across packed payload
+      uint16_t payload_checksum = 0;
+      for (size_t i = 0; i < packed_count; ++i)
+      {
+        payload_checksum ^= packed_words[i];
+      }
+
+      // Print formatted packet to serial monitor
+      printf("LOGAN HEADER: 0x%04X\r\n", header_word);
+      printf("LOGAN PAYLOAD (%u words for %u samples):\r\n", (unsigned)packed_count, (unsigned)g_logan_sample_index);
+      for (size_t i = 0; i < packed_count; ++i)
+      {
+        printf("0x%04X%s", packed_words[i], ((i + 1) % 16 == 0 || i + 1 == packed_count) ? "\r\n" : " ");
+      }
+      printf("LOGAN CHECKSUM: 0x%04X\r\n", payload_checksum);
+
+      // Commit payload and start transfer
+      SPIComm::set_logan_payload(packed_words, packed_count);
+      SPIComm::start_dummy_samples_transfer();
+
+      // If continuous mode enabled, immediately re-arm sampling for the next block
+      if (g_logan_continuous)
+      {
+        size_t rate_khz = SPIComm::rate_from_nibble(g_logan_rate_nibble);
+        if (rate_khz == 0) rate_khz = 1;
+        int64_t interval_us = static_cast<int64_t>(1000 / rate_khz);
+        if (interval_us <= 0) interval_us = 1;
+
+        cancel_repeating_timer(&g_logan_timer);
+        g_logan_sample_index = 0;
+        g_logan_sampling_active = true;
+        add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
+        printf("LOGAN RE-ARM: rate_khz=%u interval_us=%lld\r\n",
+               (unsigned)rate_khz,
+               (long long)interval_us);
+      }
+    }
+    else
     {
-      printf("0x%04X%s", packed_words[i], ((i + 1) % 16 == 0 || i + 1 == packed_count) ? "\r\n" : " ");
+      // Defer packaging until TX bulk channel is available
+      printf("LOGAN TX busy - packaging deferred\r\n");
     }
-    printf("LOGAN CHECKSUM: 0x%04X\r\n", payload_checksum);
-
-    // Commit payload and start transfer
-    SPIComm::set_logan_payload(packed_words, packed_count);
-    SPIComm::start_dummy_samples_transfer();
   }
 
   static absolute_time_t last_debug_time = 0;
