@@ -14,7 +14,7 @@ extern volatile bool g_start_requested;
 class SPIComm
 {
 private:
-  static constexpr uint32_t SPI_BAUD = 30000000;
+  static constexpr uint32_t SPI_BAUD = 10000000;
   static constexpr uint8_t PIN_SCK = 10;
   static constexpr uint8_t PIN_MISO = 11;
   static constexpr uint8_t PIN_MOSI = 12;
@@ -40,7 +40,7 @@ private:
 
   // Unified TX transaction queue (events and bulk transfers)
   enum TxItemType : uint8_t { TX_EVENT = 1, TX_BULK = 2 };
-  static constexpr size_t TXQ_CAPACITY = 64;
+  static constexpr size_t TXQ_CAPACITY = 128;
   static uint8_t txq_type[TXQ_CAPACITY];
   static uint16_t txq_word[TXQ_CAPACITY];
   static uint32_t txq_head;
@@ -63,7 +63,7 @@ private:
     return type ^ action ^ value;
   }
 
-  // Map samples nibble to number of 16-bit payload sample words
+  // Map samples nibble to number of 1-bit samples
   static inline size_t map_samples_nibble(uint8_t samples_nibble)
   {
     switch (samples_nibble & 0x0F)
@@ -140,12 +140,35 @@ private:
   {
     while (tx_fifo_not_full())
     {
-      // Continue active bulk first
+      // Continue active bulk, but interleave high-priority events between payload words
       if (logan_queue_active)
       {
-        preload_dummy_tx_fifo();
-        if (!tx_fifo_not_full()) break;
-        if (has_dummy_samples_pending()) continue;
+        // If an event is pending, emit it first
+        if (txq_count > 0 && txq_type[txq_tail] == TX_EVENT)
+        {
+          uint16_t word = txq_word[txq_tail];
+          txq_tail = (txq_tail + 1) & (TXQ_CAPACITY - 1);
+          --txq_count;
+          if (!tx_fifo_not_full())
+          {
+            // push back if no space
+            txq_tail = (txq_tail + TXQ_CAPACITY - 1) & (TXQ_CAPACITY - 1);
+            ++txq_count;
+            txq_word[txq_tail] = word;
+            txq_type[txq_tail] = TX_EVENT;
+            break;
+          }
+          spi_get_hw(spi1)->dr = word;
+          continue;
+        }
+
+        // Otherwise, emit a single payload word
+        uint16_t payload_word = 0;
+        if (try_get_next_dummy_word(payload_word))
+        {
+          spi_get_hw(spi1)->dr = payload_word;
+          continue;
+        }
         // Bulk finished
         logan_queue_active = false;
         continue;
@@ -182,8 +205,6 @@ private:
         logan_queue_index = 0;
         logan_queue_active = true;
         logan_queued = false;
-        preload_dummy_tx_fifo();
-        if (!tx_fifo_not_full()) break;
         continue;
       }
     }
@@ -199,32 +220,33 @@ private:
 
   static void spi_slave_irq_handler()
   {
-    uint32_t status = save_and_disable_interrupts();
+    // Keep ISR preemptible: avoid globally disabling interrupts
 
-    // Clear all pending interrupts
+    // Clear pending RX interrupts
     spi_get_hw(spi1)->icr = SPI_SSPICR_RTIC_BITS | SPI_SSPICR_RORIC_BITS;
 
     bool stop_seen = false;
     bool start_seen = false;
     uint16_t last_non_control = 0;
 
+    // Drain RX FIFO
     while (spi_is_readable(spi1))
     {
       uint16_t w = spi_get_hw(spi1)->dr;
       if (w == CMD_STOP) { stop_seen = true; continue; }
       if (w == CMD_START) { start_seen = true; continue; }
-      last_non_control = w;
+      // Only update last_non_control for non-zero words to avoid overwriting with zeros
+      if (w != 0) { last_non_control = w; }
     }
 
     // Latch control commands as flags; do not publish them into g_rx_word
     if (stop_seen) g_stop_requested = true;
     if (start_seen) g_start_requested = true;
-    if (last_non_control != 0 && g_rx_word == 0) g_rx_word = last_non_control;
+    // Always capture the latest non-control RX word; prevents losing STOP if CONFIG precedes it
+    if (last_non_control != 0) g_rx_word = last_non_control;
 
-    // Service TX FIFO with queued transactions (interrupts already disabled)
+    // Service TX FIFO without disabling interrupts to keep GPIO IRQs responsive
     service_tx_fifo_locked();
-
-    restore_interrupts(status);
   }
 
 public:
@@ -249,6 +271,8 @@ public:
     spi_get_hw(spi1)->imsc = SPI_SSPIMSC_RXIM_BITS;
     irq_set_exclusive_handler(SPI1_IRQ, spi_slave_irq_handler);
     irq_set_enabled(SPI1_IRQ, true);
+    // Lower SPI1 IRQ priority so GPIO events can preempt during heavy transfers
+    irq_set_priority(SPI1_IRQ, 0xA0);
   }
 
   static bool queue_packet(uint16_t packet)
@@ -271,8 +295,8 @@ public:
       txq_head = (txq_head + 1) & (TXQ_CAPACITY - 1);
       ++txq_count;
       restore_interrupts(status);
-      // Try to kick the TX engine
-      service_tx_fifo();
+      // Try to kick the TX engine without disabling interrupts
+      service_tx_fifo_locked();
       return true;
     }
 
@@ -335,7 +359,8 @@ public:
                         ((value & 0x0F) << 4) |
                         (checksum & 0x0F);
 
-    logan_payload_words = map_samples_nibble(samples_nibble);
+    size_t samples = map_samples_nibble(samples_nibble);
+    logan_payload_words = (samples + 3) / 4; // convert samples to 16-bit payload words
     logan_total_words = 1 /*header*/ + logan_payload_words + 1 /*checksum*/;
     logan_checksum_accum = 0;
   }
@@ -387,6 +412,46 @@ public:
       service_tx_fifo();
       return;
     }
+    restore_interrupts(status);
+  }
+
+  // Cancel any queued or active LOGAN bulk transfer immediately
+  static inline void cancel_logan_transfer()
+  {
+    uint32_t status = save_and_disable_interrupts();
+    // Remove any queued TX_BULK items
+    if (txq_count > 0)
+    {
+      // Compact queue by skipping TX_BULK items
+      uint32_t write_pos = txq_tail;
+      uint32_t new_count = 0;
+      for (uint32_t i = 0; i < txq_count; ++i)
+      {
+        uint32_t idx = (txq_tail + i) & (TXQ_CAPACITY - 1);
+        if (txq_type[idx] != TX_BULK)
+        {
+          // keep events by moving to new_tail if necessary
+          if (idx != write_pos)
+          {
+            txq_type[write_pos] = txq_type[idx];
+            txq_word[write_pos] = txq_word[idx];
+          }
+          write_pos = (write_pos + 1) & (TXQ_CAPACITY - 1);
+          ++new_count;
+        }
+      }
+      // Tail remains the same; head advances to write_pos
+      txq_head = write_pos;
+      txq_count = new_count;
+    }
+
+    // Abort active bulk playback
+    logan_queue_active = false;
+    logan_queued = false;
+    logan_queue_index = 0;
+    logan_total_words = 0;
+    logan_payload_words = 0;
+    logan_checksum_accum = 0;
     restore_interrupts(status);
   }
 

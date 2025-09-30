@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <cstddef>
+#include <hardware/sync.h>
 
 constexpr size_t BUFFER_SIZE = 256;
 
