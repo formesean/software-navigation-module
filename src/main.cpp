@@ -435,21 +435,17 @@ void process_buffered_events()
       uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
       uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
 
-      bool is_logan_cmd = ((rx_high_byte >> 4) == 0x06);
-      if (is_logan_cmd && rx_high_byte != 0x00 && rx_low_byte != 0x00)
+      // New LOGAN header: top bit of top nibble set
+      bool is_logan_cmd = ((rx_high_byte & 0x80) != 0);
+      if (is_logan_cmd && (rx_high_byte != 0x00 || rx_low_byte != 0x00))
       {
-        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // 0x6
-        uint8_t samples_nibble =  rx_high_byte       & 0x0F;
-        uint8_t rate_nibble    = (rx_low_byte  >> 4) & 0x0F;
-        uint8_t rx_checksum    =  rx_low_byte        & 0x0F;
+        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // 1ccc (c=channel)
+        uint8_t trig_mode_nib  =  rx_high_byte       & 0x0F;
+        uint8_t samples_nibble = (rx_low_byte  >> 4) & 0x0F;
+        uint8_t rate_nibble    =  rx_low_byte        & 0x0F;
 
-        uint8_t calc = (type_nibble ^ samples_nibble ^ rate_nibble) & 0x0F;
-        bool checksum_ok = (calc == rx_checksum);
-        if (!checksum_ok)
-        {
-          printf("LOGAN RX checksum mismatch: rx=%02X %02X calc=%X (proceeding)\r\n",
-                 (unsigned)rx_high_byte, (unsigned)rx_low_byte, (unsigned)calc);
-        }
+        uint8_t trig_channel   = type_nibble & 0x07; // 0..4
+
         if (samples_nibble == 0x0 && rate_nibble == 0x0)
         {
           // LOGAN STOP
@@ -491,7 +487,9 @@ void process_buffered_events()
 
           add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
 
-          printf("LOGAN ARM: samples=%u words=%u rate_khz=%u interval_us=%lld continuous=1\r\n",
+          printf("LOGAN ARM: ch=%u trig=%u samples=%u words=%u rate_khz=%u interval_us=%lld continuous=1\r\n",
+                 (unsigned)trig_channel,
+                 (unsigned)trig_mode_nib,
                  (unsigned)sample_count,
                  (unsigned)expected_words_clamped,
                  (unsigned)rate_khz,
@@ -568,15 +566,16 @@ void process_buffered_events()
       if (payload_words > 600) payload_words = 600;
       for (size_t i = packed_count; i < payload_words; ++i) packed_words[i] = 0;
 
-      // Build header from nibbles
+      // Build header from nibbles (new format): [15:12]=1ccc, [11:8]=trig_mode, [7:4]=samples, [3:0]=rate
       uint8_t samples_nib = g_logan_samples_nibble;
-      uint8_t rate_nib = g_logan_rate_nibble;
-      uint8_t type_nib = 0x06;
-      uint8_t hdr_csum = (type_nib ^ (samples_nib & 0x0F) ^ (rate_nib & 0x0F)) & 0x0F;
-      uint16_t header_word = ((type_nib & 0x0F) << 12) |
-                             ((samples_nib & 0x0F) << 8) |
-                             ((rate_nib & 0x0F) << 4) |
-                             (hdr_csum & 0x0F);
+      uint8_t rate_nib    = g_logan_rate_nibble;
+      uint8_t trig_chan   = 0;  // device currently doesn't use; set 0
+      uint8_t trig_mode   = 0;  // device currently doesn't use; set 0
+      uint8_t type_nib    = static_cast<uint8_t>(0x8 | (trig_chan & 0x07));
+      uint16_t header_word = ((type_nib   & 0x0F) << 12) |
+                             ((trig_mode  & 0x0F) << 8)  |
+                             ((samples_nib& 0x0F) << 4)  |
+                             ((rate_nib   & 0x0F) << 0);
 
       // Configure custom header with correct payload size in words
       SPIComm::configure_custom_header(header_word, payload_words);
