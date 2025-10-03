@@ -75,14 +75,43 @@ static volatile bool g_logan_sampling_active = false;
 static volatile bool g_logan_sampling_done = false;
 static volatile size_t g_logan_sample_target = 0;
 static volatile size_t g_logan_sample_index = 0;
-static uint16_t g_logan_sample_buffer[2000];
+static uint16_t g_logan_sample_buffer[4][2000];
 static volatile uint8_t g_logan_samples_nibble = 0;
 static volatile uint8_t g_logan_rate_nibble = 0;
 static volatile bool g_logan_continuous = false;
 static volatile size_t g_logan_expected_words = 0; // expected payload words derived from nibble
 static volatile bool g_logan_abort_requested = false;
 
+// Multi-channel LOGAN TX sequencing state
+static volatile bool g_logan_tx_sequence_active = false;
+static volatile uint8_t g_logan_tx_next_channel = 1; // 1..4
+
 static constexpr bool LOGAN_DEBUG_PRINT = false;
+
+// Ensure a payload word cannot be misinterpreted as an SNM event by the host.
+// If the top nibble equals 0x1 (SNM type range risk), and the checksum nibble equals
+// type^action^value, tweak bit 1 of the checksum nibble (LSB preserved) to break equality.
+static inline uint16_t harden_payload_word(uint16_t w)
+{
+  uint8_t nib3 = static_cast<uint8_t>((w >> 12) & 0x0F);
+  if (nib3 == 0x1)
+  {
+    uint8_t nib2 = static_cast<uint8_t>((w >> 8) & 0x0F);
+    uint8_t nib1 = static_cast<uint8_t>((w >> 4) & 0x0F);
+    uint8_t nib0 = static_cast<uint8_t>(w & 0x0F);
+    uint8_t checksum = static_cast<uint8_t>((nib3 ^ nib2 ^ nib1) & 0x0F);
+    if (nib0 == checksum)
+    {
+      // Flip bit 1 to break checksum equality while preserving the LSB sample bit
+      nib0 ^= 0x2;
+      w = static_cast<uint16_t>(((nib3 & 0x0F) << 12) |
+                                ((nib2 & 0x0F) << 8)  |
+                                ((nib1 & 0x0F) << 4)  |
+                                (nib0 & 0x0F));
+    }
+  }
+  return w;
+}
 
 // Pack raw 1-bit samples (stored as 0/1) into 16-bit words per nibble rules
 // First word contains remainder (N % 4) samples in low nibbles, then full words of 4 samples
@@ -104,6 +133,7 @@ static size_t pack_samples_to_words(const uint16_t *in_samples, size_t sample_co
       uint16_t nibble = static_cast<uint16_t>(in_samples[read_index++] & 0xF);
       w |= static_cast<uint16_t>(nibble << (i * 4));
     }
+    w = harden_payload_word(w);
     out_words[write_index++] = w;
   }
 
@@ -115,6 +145,7 @@ static size_t pack_samples_to_words(const uint16_t *in_samples, size_t sample_co
       uint16_t nibble = static_cast<uint16_t>(in_samples[read_index++] & 0xF);
       w |= static_cast<uint16_t>(nibble << (i * 4));
     }
+    w = harden_payload_word(w);
     out_words[write_index++] = w;
   }
 
@@ -132,9 +163,13 @@ bool logan_timer_callback(repeating_timer_t *rt)
     return false;
   }
 
-  // Sample first channel (digital read); extend to multi-channel if needed
-  uint16_t sample = static_cast<uint16_t>(gpio_get(LOGAN_PINS[0]) & 0x1);
-  g_logan_sample_buffer[g_logan_sample_index++] = sample;
+  // Sample all channels this tick into per-channel buffers
+  for (uint8_t ch = 0; ch < 4; ++ch)
+  {
+    uint16_t sample = static_cast<uint16_t>(gpio_get(LOGAN_PINS[ch]) & 0x1);
+    g_logan_sample_buffer[ch][g_logan_sample_index] = sample;
+  }
+  g_logan_sample_index++;
 
   if (g_logan_sample_index >= g_logan_sample_target)
   {
@@ -280,6 +315,8 @@ void reset_system_state()
   g_logan_rate_nibble = 0;
   g_logan_continuous = false;
   cancel_repeating_timer(&g_logan_timer);
+  g_logan_tx_sequence_active = false;
+  g_logan_tx_next_channel = 1;
 }
 
 void shared_irq_handler()
@@ -458,6 +495,8 @@ void process_buffered_events()
           g_logan_sample_target = 0;
           g_logan_expected_words = 0;
           SPIComm::cancel_logan_transfer();
+          g_logan_tx_sequence_active = false;
+          g_logan_tx_next_channel = 1;
           printf("LOGAN STOP received; sampling and transfer cancelled\r\n");
           g_rx_word = 0; // consume
         }
@@ -465,7 +504,7 @@ void process_buffered_events()
         {
           // LOGAN START / (re-)arm
           size_t expected_samples = SPIComm::samples_from_nibble(samples_nibble);
-          size_t max_samples = sizeof(g_logan_sample_buffer) / sizeof(g_logan_sample_buffer[0]);
+          size_t max_samples = sizeof(g_logan_sample_buffer[0]) / sizeof(g_logan_sample_buffer[0][0]);
           size_t sample_count = (expected_samples > max_samples) ? max_samples : expected_samples;
           size_t expected_words_clamped = (sample_count + 3) / 4;
           size_t rate_khz     = SPIComm::rate_from_nibble(rate_nibble);
@@ -540,90 +579,94 @@ void process_buffered_events()
     sleep_us(50);
   }
 
-  // Dummy samples are now streamed by SPI TX FIFO preloading within SPIComm
-  // If LOGAN sampling finished, prepare payload and start transfer
-  if (g_logan_sampling_done)
+  // LOGAN multi-channel: when sampling finished, queue channel packets sequentially (1..4)
+  if (g_logan_sampling_done || (g_logan_tx_sequence_active && !SPIComm::is_logan_transfer_busy()))
   {
-    // If an abort was requested after finishing, drop this block entirely
-    if (g_logan_abort_requested)
+    // Handle abort before starting/continuing sequence
+    if (g_logan_sampling_done && g_logan_abort_requested)
     {
       g_logan_sampling_done = false;
       g_logan_sample_index = 0;
       g_logan_sample_target = 0;
       g_logan_expected_words = 0;
+      g_logan_tx_sequence_active = false;
       return;
     }
-    // Only package and send when the previous bulk is not busy
-    if (!SPIComm::is_logan_transfer_busy())
+
+    // If just completed sampling and TX is idle, start sequence at channel 1
+    if (g_logan_sampling_done && !SPIComm::is_logan_transfer_busy())
     {
       g_logan_sampling_done = false;
-
-      // Pack raw 0/1 samples into nibble-packed 16-bit words
-      uint16_t packed_words[600]; // supports up to 2000 samples => 500 words, margin added
-      size_t packed_count = pack_samples_to_words(g_logan_sample_buffer, g_logan_sample_index, packed_words, 600);
-      // Ensure payload has exactly the expected number of words (pad with zeros if needed)
-      size_t payload_words = g_logan_expected_words > 0 ? g_logan_expected_words : packed_count;
-      if (payload_words > 600) payload_words = 600;
-      for (size_t i = packed_count; i < payload_words; ++i) packed_words[i] = 0;
-
-      // Build header from nibbles (new format): [15:12]=1ccc, [11:8]=trig_mode, [7:4]=samples, [3:0]=rate
-      uint8_t samples_nib = g_logan_samples_nibble;
-      uint8_t rate_nib    = g_logan_rate_nibble;
-      uint8_t trig_chan   = 0;  // device currently doesn't use; set 0
-      uint8_t trig_mode   = 0;  // device currently doesn't use; set 0
-      uint8_t type_nib    = static_cast<uint8_t>(0x8 | (trig_chan & 0x07));
-      uint16_t header_word = ((type_nib   & 0x0F) << 12) |
-                             ((trig_mode  & 0x0F) << 8)  |
-                             ((samples_nib& 0x0F) << 4)  |
-                             ((rate_nib   & 0x0F) << 0);
-
-      // Configure custom header with correct payload size in words
-      SPIComm::configure_custom_header(header_word, payload_words);
-
-      // Compute checksum across packed payload
-      uint16_t payload_checksum = 0;
-      for (size_t i = 0; i < payload_words; ++i)
-      {
-        payload_checksum ^= packed_words[i];
-      }
-
-      if (LOGAN_DEBUG_PRINT)
-      {
-        // Print formatted packet to serial monitor (debug only)
-        printf("LOGAN HEADER: 0x%04X\r\n", header_word);
-        printf("LOGAN PAYLOAD (%u words for %u samples):\r\n", (unsigned)packed_count, (unsigned)g_logan_sample_index);
-        for (size_t i = 0; i < packed_count; ++i)
-        {
-          printf("0x%04X%s", packed_words[i], ((i + 1) % 16 == 0 || i + 1 == packed_count) ? "\r\n" : " ");
-        }
-        printf("LOGAN CHECKSUM: 0x%04X\r\n", payload_checksum);
-      }
-
-      // Commit payload and start transfer
-      SPIComm::set_logan_payload(packed_words, payload_words);
-      SPIComm::start_dummy_samples_transfer();
-
-      // If continuous mode enabled, immediately re-arm sampling for the next block
-      if (g_logan_continuous)
-      {
-        size_t rate_khz = SPIComm::rate_from_nibble(g_logan_rate_nibble);
-        if (rate_khz == 0) rate_khz = 1;
-        int64_t interval_us = static_cast<int64_t>(1000 / rate_khz);
-        if (interval_us <= 0) interval_us = 1;
-
-        cancel_repeating_timer(&g_logan_timer);
-        g_logan_sample_index = 0;
-        g_logan_sampling_active = true;
-        add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-        printf("LOGAN RE-ARM: rate_khz=%u interval_us=%lld\r\n",
-               (unsigned)rate_khz,
-               (long long)interval_us);
-      }
+      g_logan_tx_sequence_active = true;
+      g_logan_tx_next_channel = 1;
     }
-    else
+
+    // If a sequence is active and TX is idle, send next channel
+    if (g_logan_tx_sequence_active && !SPIComm::is_logan_transfer_busy())
     {
-      // Defer packaging until TX bulk channel is available
-      printf("LOGAN TX busy - packaging deferred\r\n");
+      if (g_logan_tx_next_channel >= 1 && g_logan_tx_next_channel <= 4)
+      {
+        uint8_t ch = static_cast<uint8_t>(g_logan_tx_next_channel - 1);
+
+        // Pack raw 0/1 samples into nibble-packed 16-bit words for this channel
+        uint16_t packed_words[600];
+        size_t packed_count = pack_samples_to_words(g_logan_sample_buffer[ch], g_logan_sample_index, packed_words, 600);
+        size_t payload_words = g_logan_expected_words > 0 ? g_logan_expected_words : packed_count;
+        if (payload_words > 600) payload_words = 600;
+        for (size_t i = packed_count; i < payload_words; ++i) packed_words[i] = 0;
+
+        // Build header per channel: [15:12]=1ccc where ccc = channel (1..4)
+        uint8_t samples_nib = g_logan_samples_nibble;
+        uint8_t rate_nib    = g_logan_rate_nibble;
+        uint8_t chan_num    = g_logan_tx_next_channel; // 1..4
+        uint8_t trig_mode   = 0;
+        uint8_t type_nib    = static_cast<uint8_t>(0x8 | (chan_num & 0x07));
+        uint16_t header_word = ((type_nib   & 0x0F) << 12) |
+                               ((trig_mode  & 0x0F) << 8)  |
+                               ((samples_nib& 0x0F) << 4)  |
+                               ((rate_nib   & 0x0F) << 0);
+
+        SPIComm::configure_custom_header(header_word, payload_words);
+
+        if (LOGAN_DEBUG_PRINT)
+        {
+          printf("LOGAN CH%u HEADER: 0x%04X words=%u samples=%u\r\n",
+                 (unsigned)chan_num,
+                 header_word,
+                 (unsigned)payload_words,
+                 (unsigned)g_logan_sample_index);
+        }
+
+        SPIComm::set_logan_payload(packed_words, payload_words);
+        SPIComm::start_dummy_samples_transfer();
+
+        g_logan_tx_next_channel++;
+      }
+      else
+      {
+        // Finished all 4 channels
+        g_logan_tx_sequence_active = false;
+
+        // If continuous, re-arm sampling for next multi-channel block
+        if (g_logan_continuous)
+        {
+          size_t rate_khz = SPIComm::rate_from_nibble(g_logan_rate_nibble);
+          if (rate_khz == 0) rate_khz = 1;
+          int64_t interval_us = static_cast<int64_t>(1000 / rate_khz);
+          if (interval_us <= 0) interval_us = 1;
+
+          cancel_repeating_timer(&g_logan_timer);
+          g_logan_sample_index = 0;
+          g_logan_sampling_active = true;
+          add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
+          if (LOGAN_DEBUG_PRINT)
+          {
+            printf("LOGAN RE-ARM: rate_khz=%u interval_us=%lld\r\n",
+                   (unsigned)rate_khz,
+                   (long long)interval_us);
+          }
+        }
+      }
     }
   }
 
