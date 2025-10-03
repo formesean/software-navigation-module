@@ -86,7 +86,8 @@ private:
   {
     switch (sampling_rate_nibble & 0x0F)
     {
-      case 0x7: return 100;
+      case 0x8: return 100;
+      case 0x7: return 60;
       case 0x6: return 50;
       case 0x5: return 20;
       case 0x4: return 10;
