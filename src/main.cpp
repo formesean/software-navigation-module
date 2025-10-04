@@ -21,7 +21,15 @@ const uint8_t ENCODER_CLK = 4;
 const uint8_t LED_PIN = 25;
 const uint8_t PWM_PIN = 15;
 
-const float PWM_FREQ_HZ = 500.0f;
+// PWM Configuration for Logic Analyzer Testing
+const float PWM_FREQ_HZ = 1000.0f;
+const float PWM_DUTY_CYCLE = 0.5f;
+const bool PWM_ALWAYS_ENABLED = true;
+
+// PWM state tracking
+static uint g_pwm_slice_num = 0;
+static uint g_pwm_channel = 0;
+static volatile bool g_pwm_initialized = false;
 
 // State Variables
 RingBuffer ringBuffer;
@@ -343,6 +351,12 @@ void reset_system_state()
   for (uint8_t ch = 0; ch < 4; ++ch)
   {
     gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+  }
+
+  // Ensure PWM remains enabled for testing (always on)
+  if (g_pwm_initialized)
+  {
+    pwm_set_enabled(g_pwm_slice_num, PWM_ALWAYS_ENABLED);
   }
 }
 
@@ -918,20 +932,46 @@ void process_buffered_events()
 
 void setup_pwm(uint pin)
 {
+  // Configure GPIO for PWM function
   gpio_set_function(pin, GPIO_FUNC_PWM);
 
-  float divider = 4.0f;
+  // Get PWM slice and channel numbers
+  g_pwm_slice_num = pwm_gpio_to_slice_num(pin);
+  g_pwm_channel = pwm_gpio_to_channel(pin);
 
-  uint slice_num = pwm_gpio_to_slice_num(pin);
-  uint channel   = pwm_gpio_to_channel(pin);
+  // Calculate optimal PWM parameters for logic analyzer testing
+  uint32_t sys_clk = clock_get_hz(clk_sys);  // System clock frequency (~125 MHz)
 
-  uint32_t sys_clk = clock_get_hz(clk_sys);
+  // Use a reasonable divider for stable operation
+  // Target: good resolution while avoiding overflow
+  float divider = 125.0f;  // 125 MHz / 125 = 1 MHz PWM base frequency
+
+  // Calculate wrap value for desired frequency
   uint32_t wrap = (uint32_t)((sys_clk / (divider * PWM_FREQ_HZ)) - 1);
 
-  pwm_set_clkdiv(slice_num, divider);
-  pwm_set_wrap(slice_num, wrap);
-  pwm_set_chan_level(slice_num, channel, wrap / 2);
-  pwm_set_enabled(slice_num, true);
+  // Ensure wrap value is reasonable (minimum 1, maximum 65535)
+  if (wrap < 1) wrap = 1;
+  if (wrap > 65535) wrap = 65535;
+
+  // Set PWM configuration
+  pwm_set_clkdiv(g_pwm_slice_num, divider);
+  pwm_set_wrap(g_pwm_slice_num, wrap);
+
+  // Set duty cycle (50% for clean clock signal)
+  uint32_t level = (uint32_t)(wrap * PWM_DUTY_CYCLE);
+  pwm_set_chan_level(g_pwm_slice_num, g_pwm_channel, level);
+
+  // Always enable PWM for consistent testing
+  pwm_set_enabled(g_pwm_slice_num, PWM_ALWAYS_ENABLED);
+
+  g_pwm_initialized = true;
+
+  printf("PWM initialized for LOGAN testing:\r\n");
+  printf("  Pin: %u, Slice: %u, Channel: %u\r\n", pin, g_pwm_slice_num, g_pwm_channel);
+  printf("  Frequency: %.1f Hz, Divider: %.1f, Wrap: %u, Level: %u\r\n",
+         PWM_FREQ_HZ, divider, wrap, level);
+  printf("  Duty Cycle: %.1f%%, Always Enabled: %s\r\n",
+         PWM_DUTY_CYCLE * 100.0f, PWM_ALWAYS_ENABLED ? "YES" : "NO");
 }
 
 bool is_snm_event(uint16_t word)
