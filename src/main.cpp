@@ -68,6 +68,8 @@ void process_buffered_events();
 void initialize_pin_states();
 void setup_pwm(uint pin);
 void reset_system_state();
+bool is_snm_event(uint16_t word);
+void handle_snm_announcement(uint16_t word);
 
 // LOGAN sampling timer and buffers
 static repeating_timer_t g_logan_timer;
@@ -469,6 +471,19 @@ void process_buffered_events()
     }
     else
     {
+      // Check if this is an SNM event (including announcements)
+      if (is_snm_event(rx_snapshot))
+      {
+        const uint8_t type = static_cast<uint8_t>((rx_snapshot >> 12) & 0x0F);
+        if (type == 0xA) // SNM announcement
+        {
+          handle_snm_announcement(rx_snapshot);
+        }
+        // Other SNM events (macro keys, encoder) are handled by the existing event system
+        g_rx_word = 0; // consume the event
+        return;
+      }
+
       uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
       uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
 
@@ -693,6 +708,59 @@ void setup_pwm(uint pin)
   pwm_set_wrap(slice_num, wrap);
   pwm_set_chan_level(slice_num, channel, wrap / 2);
   pwm_set_enabled(slice_num, true);
+}
+
+bool is_snm_event(uint16_t word)
+{
+  const uint8_t type = static_cast<uint8_t>((word >> 12) & 0x0F);
+  if ((type & 0x8) != 0) return false; // exclude LOGAN headers
+
+  // Validate checksum against SNM packet format
+  const uint8_t action   = static_cast<uint8_t>((word >> 8)  & 0x0F);
+  const uint8_t value    = static_cast<uint8_t>((word >> 4)  & 0x0F);
+  const uint8_t checksum = static_cast<uint8_t>( word        & 0x0F);
+  const bool checksum_ok = (checksum == ((type ^ action ^ value) & 0x0F));
+
+  // Accept SNM events: macro keys (1), encoder rotate (2), encoder switch (3), announcements (0xA)
+  return checksum_ok && ((type >= 0x1 && type <= 0x3) || type == 0xA);
+}
+
+void handle_snm_announcement(uint16_t word)
+{
+  const uint8_t type   = static_cast<uint8_t>((word >> 12) & 0x0F);
+  const uint8_t action = static_cast<uint8_t>((word >> 8)  & 0x0F);
+  const uint8_t value  = static_cast<uint8_t>((word >> 4)  & 0x0F);
+
+  if (type == 0xA && action == 0x1) // SNM announcement
+  {
+    if (value == 0x1) // SNM attached
+    {
+      printf("SNM ANNOUNCE: Master attached\r\n");
+
+      // Send acknowledgment response
+      uint16_t ack_response = SPIComm::create_snm_announce_event(true); // Echo back attached=true
+      if (!SPIComm::queue_packet(ack_response))
+      {
+        ringBuffer.push(ack_response);
+      }
+      request_led_blink();
+    }
+    else if (value == 0x0) // Program stopping
+    {
+      printf("SNM ANNOUNCE: Master stopping\r\n");
+
+      // Send acknowledgment response
+      uint16_t ack_response = SPIComm::create_snm_announce_event(false); // Echo back attached=false
+      if (!SPIComm::queue_packet(ack_response))
+      {
+        ringBuffer.push(ack_response);
+      }
+      request_led_blink();
+
+      // Trigger system stop - same as receiving STOP_CMD
+      g_stop_requested = true;
+    }
+  }
 }
 
 // EOF

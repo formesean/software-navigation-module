@@ -26,6 +26,7 @@ private:
   static constexpr uint8_t EVENT_MACRO_KEY = 0x01;
   static constexpr uint8_t EVENT_ENCODER_ROTATE = 0x02;
   static constexpr uint8_t EVENT_ENCODER_SWITCH = 0x03;
+  static constexpr uint8_t EVENT_SNM_ANNOUNCE = 0x0A;
 
   static constexpr uint8_t ENCODER_CW = 0x01;
   static constexpr uint8_t ENCODER_CCW = 0x02;
@@ -33,6 +34,10 @@ private:
 
   static constexpr uint8_t STATE_PRESSED = 0x01;
   static constexpr uint8_t STATE_RELEASED = 0x00;
+
+  static constexpr uint8_t SNM_ANNOUNCE_ACTION = 0x01;
+  static constexpr uint8_t SNM_ATTACHED_VALUE = 0x01;
+  static constexpr uint8_t SNM_STOPPING_VALUE = 0x00;
 
   // TX FIFO based streaming state
   static size_t logan_queue_index;
@@ -334,6 +339,14 @@ public:
     uint8_t checksum = compute_event_checksum(EVENT_ENCODER_SWITCH, ENCODER_BTN, value);
 
     return create_event_packet(EVENT_ENCODER_SWITCH, ENCODER_BTN, value, checksum);
+  }
+
+  static inline uint16_t create_snm_announce_event(bool attached)
+  {
+    uint8_t value = attached ? SNM_ATTACHED_VALUE : SNM_STOPPING_VALUE;
+    uint8_t checksum = compute_event_checksum(EVENT_SNM_ANNOUNCE, SNM_ANNOUNCE_ACTION, value);
+
+    return create_event_packet(EVENT_SNM_ANNOUNCE, SNM_ANNOUNCE_ACTION, value, checksum);
   }
 
   static inline uint16_t create_samples_packet(uint16_t samples)
