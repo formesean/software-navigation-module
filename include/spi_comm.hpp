@@ -7,10 +7,13 @@
 #include <cstdint>
 #include <stdio.h>
 
+// SPI slave communication utilities for event packets and LOGAN data streaming (RP2040 SPI1)
+
 extern volatile uint16_t g_rx_word;
 extern volatile bool g_stop_requested;
 extern volatile bool g_start_requested;
 
+// SPI slave communication: queues high-priority events and streams LOGAN sample payloads.
 class SPIComm
 {
 private:
@@ -63,6 +66,8 @@ private:
   static constexpr size_t LOGAN_MAX_SAMPLES = 2000;
   static uint16_t logan_payload_storage[LOGAN_MAX_SAMPLES];
 
+  // 0x101
+
   static inline uint8_t compute_event_checksum(uint8_t type, uint8_t action, uint8_t value)
   {
     return type ^ action ^ value;
@@ -103,7 +108,7 @@ private:
     }
   }
 
-  // Simple payload generator: repeat pattern 0x3434, 0x5656
+  // Simple payload generator (unused helper): alternating nibble pattern
   static inline uint16_t generate_sample_word(bool &toggle)
   {
     toggle = !toggle;
@@ -224,6 +229,7 @@ private:
     restore_interrupts(status);
   }
 
+  // SPI1 slave ISR: drains RX FIFO, latches control flags, and services TX FIFO
   static void spi_slave_irq_handler()
   {
     // Keep ISR preemptible: avoid globally disabling interrupts
@@ -256,12 +262,13 @@ private:
   }
 
 public:
-  // Returns true if a LOGAN bulk transfer is queued or currently active
+  // True if a LOGAN bulk transfer is queued or currently active
   static inline bool is_logan_transfer_busy()
   {
     return logan_queue_active || logan_queued;
   }
 
+  // Initialize SPI1 as a 16-bit slave and enable RX interrupt
   static void init_slave()
   {
     spi_init(spi1, SPI_BAUD);
@@ -281,6 +288,7 @@ public:
     irq_set_priority(SPI1_IRQ, 0xA0);
   }
 
+  // Enqueue a single 16-bit event packet; returns false if the queue is full
   static bool queue_packet(uint16_t packet)
   {
     uint32_t status = save_and_disable_interrupts();
@@ -310,12 +318,13 @@ public:
     return false;
   }
 
-  // Opportunistically top-up TX FIFO with dummy samples
+  // Opportunistically service TX FIFO (events and bulk)
   static void update_transmission_status()
   {
     service_tx_fifo();
   }
 
+  // Build an event packet for a macro key press/release
   static inline uint16_t create_macro_key_event(uint8_t key_num, bool pressed)
   {
     uint8_t value = pressed ? STATE_PRESSED : STATE_RELEASED;
@@ -324,6 +333,7 @@ public:
     return create_event_packet(EVENT_MACRO_KEY, key_num, value, checksum);
   }
 
+  // Build an event packet for encoder rotation (CW/CCW and step count)
   static inline uint16_t create_encoder_rotate_event(bool clockwise, uint8_t steps = 1)
   {
     uint8_t action = clockwise ? ENCODER_CW : ENCODER_CCW;
@@ -333,6 +343,7 @@ public:
     return create_event_packet(EVENT_ENCODER_ROTATE, action, value, checksum);
   }
 
+  // Build an event packet for encoder button press/release
   static inline uint16_t create_encoder_switch_event(bool pressed)
   {
     uint8_t value = pressed ? STATE_PRESSED : STATE_RELEASED;
@@ -341,6 +352,7 @@ public:
     return create_event_packet(EVENT_ENCODER_SWITCH, ENCODER_BTN, value, checksum);
   }
 
+  // Build an event packet for SNM announce/ack (attached=true/false)
   static inline uint16_t create_snm_announce_event(bool attached)
   {
     uint8_t value = attached ? SNM_ATTACHED_VALUE : SNM_STOPPING_VALUE;
@@ -349,6 +361,7 @@ public:
     return create_event_packet(EVENT_SNM_ANNOUNCE, SNM_ANNOUNCE_ACTION, value, checksum);
   }
 
+  // Build a 12-bit samples word with XOR checksum in low nibble
   static inline uint16_t create_samples_packet(uint16_t samples)
   {
     samples &= 0x0FFF;
@@ -359,8 +372,7 @@ public:
     return (samples << 4) | checksum;
   }
 
-  // Configure dynamic LOGAN stream based on RX nibbles.
-  // Sets header word and payload length; checksum is accumulated on the fly.
+  // Configure dynamic LOGAN stream from RX nibbles (sets header and payload length)
   static inline void configure_dummy_header_from_rx(uint8_t samples_nibble, uint8_t rate_nibble)
   {
     uint8_t type = 0x06;
@@ -379,6 +391,7 @@ public:
     logan_checksum_accum = 0;
   }
 
+  // Synchronous write-read of a single 16-bit word (utility/test)
   static bool send_packet(uint16_t tx_buffer)
   {
     uint16_t rx_buffer = 0;
@@ -395,11 +408,13 @@ public:
     return false;
   }
 
+  // True if TX FIFO has space
   static bool is_transmission_ready()
   {
     return tx_fifo_not_full();
   }
 
+  // 2: data in FIFO, 1: FIFO full, 0: FIFO has space/empty
   static uint8_t get_queue_status()
   {
     // 2: data in FIFO (transmitting/ready), 1: FIFO full, 0: FIFO has space/empty
@@ -408,6 +423,7 @@ public:
     return 0;
   }
 
+  // Queue a LOGAN bulk transfer (header + payload + checksum) if not already queued/active
   static inline void start_dummy_samples_transfer()
   {
     // Avoid duplicate scheduling
@@ -469,6 +485,7 @@ public:
     restore_interrupts(status);
   }
 
+  // Reset software state and reinitialize the SPI slave/ISR
   static inline void reset_state()
   {
     uint32_t status = save_and_disable_interrupts();
@@ -496,11 +513,13 @@ public:
     init_slave();
   }
 
+  // True if any dummy samples remain to transmit in the active bulk
   static inline bool has_dummy_samples_pending()
   {
     return logan_queue_active && (logan_queue_index < logan_total_words);
   }
 
+  // Fetch next word of active bulk (header, payload, then checksum)
   static inline bool try_get_next_dummy_word(uint16_t &out)
   {
     if (!has_dummy_samples_pending())
@@ -536,7 +555,7 @@ public:
     return true;
   }
 
-  // Provide accessors to mapping for external configuration
+  // Accessors for nibble mappings (external configuration)
   static inline size_t samples_from_nibble(uint8_t samples_nibble)
   {
     return map_samples_nibble(samples_nibble);
@@ -547,7 +566,7 @@ public:
     return map_sampling_rate_nibble(rate_nibble);
   }
 
-  // Copy sampled payload into internal storage to be streamed
+  // Copy nibble-packed sample payload into internal storage for streaming
   static inline void set_logan_payload(const uint16_t *data, size_t count)
   {
     if (count > logan_payload_words) count = logan_payload_words;

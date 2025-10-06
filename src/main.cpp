@@ -31,7 +31,7 @@ static uint g_pwm_slice_num = 0;
 static uint g_pwm_channel = 0;
 static volatile bool g_pwm_initialized = false;
 
-// State Variables
+// Global state
 RingBuffer ringBuffer;
 
 volatile bool led_blink_requested = false;
@@ -45,21 +45,21 @@ volatile bool g_start_requested = false;
 const uint16_t START_CMD = 0xA11A;
 const uint16_t STOP_CMD = 0xA10B;
 
-// Timing constants
+// Debounce timings
 const uint32_t ENCODER_DEBOUNCE_US = 3000;
 const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
 const uint32_t MACRO_KEY_DEBOUNCE_US = 20000;
 
-// Encoder state transition table
+// Quadrature encoder state transition table (last_state<<2 | current_state)
 const int8_t encoder_transition_table[16] = {
     0, -1, 1, 0, 1, 0, 0, -1,
     -1, 0, 0, 1, 0, 1, -1, 0};
 
-// Timing variables
+// Debounce timers
 volatile absolute_time_t last_encoder_event = 0;
 volatile absolute_time_t last_encoder_button_event = 0;
 
-// State tracking
+// Last-known input states and event flags
 volatile bool prev_macro_state[5] = {true, true, true, true, true};
 volatile absolute_time_t last_macro_debounce_time[5] = {0};
 volatile bool prev_encoder_sw_state = true;
@@ -67,7 +67,7 @@ volatile bool prev_encoder_sw_state = true;
 volatile bool macro_event_pending[5] = {false};
 volatile bool encoder_sw_event_pending = false;
 
-// Function Prototypes
+// Function prototypes
 void wait_for_usb_connect();
 void setup_pins();
 void request_led_blink();
@@ -80,7 +80,7 @@ bool is_snm_event(uint16_t word);
 void handle_snm_announcement(uint16_t word);
 void logan_trigger_handler();
 
-// LOGAN sampling timer and buffers
+// LOGAN: sampling timer and raw sample buffers (per-channel)
 static repeating_timer_t g_logan_timer;
 static volatile bool g_logan_sampling_active = false;
 static volatile bool g_logan_sampling_done = false;
@@ -90,14 +90,14 @@ static uint16_t g_logan_sample_buffer[4][2000];
 static volatile uint8_t g_logan_samples_nibble = 0;
 static volatile uint8_t g_logan_rate_nibble = 0;
 static volatile bool g_logan_continuous = false;
-static volatile size_t g_logan_expected_words = 0; // expected payload words derived from nibble
+static volatile size_t g_logan_expected_words = 0;
 static volatile bool g_logan_abort_requested = false;
 
-// Multi-channel LOGAN TX sequencing state
+// LOGAN: multi-channel transmit sequencing state
 static volatile bool g_logan_tx_sequence_active = false;
 static volatile uint8_t g_logan_tx_next_channel = 1; // 1..4
 
-// LOGAN trigger state
+// LOGAN: trigger configuration/state
 static volatile bool g_logan_trigger_armed = false;
 static volatile uint8_t g_logan_trigger_mode = 0;
 static volatile uint8_t g_logan_trigger_channel = 0;
@@ -106,11 +106,9 @@ static volatile bool g_logan_trigger_edge_falling = true;
 static volatile bool g_logan_trigger_level_low = false;
 static volatile bool g_logan_trigger_level_high = false;
 
-static constexpr bool LOGAN_DEBUG_PRINT = false;
-
-// Ensure a payload word cannot be misinterpreted as an SNM event by the host.
-// If the top nibble equals 0x1 (SNM type range risk), and the checksum nibble equals
-// type^action^value, tweak bit 1 of the checksum nibble (LSB preserved) to break equality.
+// Harden payload words so they cannot be misread as SNM events by the host.
+// If top nibble is 0x1 and checksum nibble equals type^action^value, flip bit 1
+// of the checksum nibble (keep LSB sample bit) to break equality.
 static inline uint16_t harden_payload_word(uint16_t w)
 {
   uint8_t nib3 = static_cast<uint8_t>((w >> 12) & 0x0F);
@@ -133,8 +131,8 @@ static inline uint16_t harden_payload_word(uint16_t w)
   return w;
 }
 
-// Pack raw 1-bit samples (stored as 0/1) into 16-bit words per nibble rules
-// First word contains remainder (N % 4) samples in low nibbles, then full words of 4 samples
+// Pack raw 1-bit samples (0/1) into 16-bit words (nibbles). The first word carries
+// the remainder (N % 4) samples in its low nibbles; subsequent words carry full 4-sample groups.
 static size_t pack_samples_to_words(const uint16_t *in_samples, size_t sample_count, uint16_t *out_words, size_t out_capacity)
 {
   if (sample_count == 0) return 0;
@@ -172,6 +170,8 @@ static size_t pack_samples_to_words(const uint16_t *in_samples, size_t sample_co
   return write_index;
 }
 
+// LOGAN sampling timer callback
+// Returns true to continue repeating, false to stop
 bool logan_timer_callback(repeating_timer_t *rt)
 {
   if (!g_logan_sampling_active) return false;
@@ -183,7 +183,7 @@ bool logan_timer_callback(repeating_timer_t *rt)
     return false;
   }
 
-  // Sample all channels this tick into per-channel buffers
+  // Sample all channels into per-channel buffers
   for (uint8_t ch = 0; ch < 4; ++ch)
   {
     uint16_t sample = static_cast<uint16_t>(gpio_get(LOGAN_PINS[ch]) & 0x1);
@@ -201,6 +201,7 @@ bool logan_timer_callback(repeating_timer_t *rt)
   return true;
 }
 
+// Program entry point: initializes IO, IRQs, PWM test output, SPI slave, and runs event loop
 int main()
 {
   stdio_init_all();
@@ -215,7 +216,7 @@ int main()
   irq_set_exclusive_handler(IO_IRQ_BANK0, shared_irq_handler);
   irq_set_enabled(IO_IRQ_BANK0, true);
 
-  // Prioritize GPIO events over timer sampling to avoid missed encoder/macro events during LOGAN
+  // Prioritize GPIO over timer sampling to avoid missing encoder/macro events under LOGAN load
   irq_set_priority(IO_IRQ_BANK0, 0);       // Highest priority for GPIO bank
   irq_set_priority(TIMER_IRQ_0, 0xC0);     // Lower priority for timer alarms
   irq_set_priority(TIMER_IRQ_1, 0xC0);
@@ -258,6 +259,7 @@ void wait_for_usb_connect()
   sleep_ms(100);
 }
 
+// Initialize GPIO directions and pulls for macro keys, encoder, LOGAN inputs, and LED
 void setup_pins()
 {
   for (uint key : MACRO_KEYS)
@@ -307,6 +309,7 @@ void request_led_blink()
   led_blink_requested = true;
 }
 
+// Reset runtime state: SPI queues, buffers, input tracking, LOGAN sampling/trigger, and PWM enable
 void reset_system_state()
 {
   SPIComm::reset_state();
@@ -360,11 +363,12 @@ void reset_system_state()
   }
 }
 
+// Shared GPIO IRQ handler: handles LOGAN trigger, macro keys, encoder rotation and switch
 void shared_irq_handler()
 {
   absolute_time_t now = get_absolute_time();
 
-  // Handle LOGAN trigger first (highest priority)
+  // LOGAN trigger first (highest priority)
   logan_trigger_handler();
 
   // Handle macro keys
@@ -390,7 +394,7 @@ void shared_irq_handler()
 
           uint16_t event_data = SPIComm::create_macro_key_event(i + 1, current_pressed);
 
-          // Attempt immediate SPI queueing; fallback to ring buffer if busy/full
+          // Try to queue immediately; fallback to ring buffer if busy/full
           if (!SPIComm::queue_packet(event_data))
           {
             ringBuffer.push(event_data);
@@ -427,7 +431,7 @@ void shared_irq_handler()
 
           uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
 
-          // Attempt immediate SPI queueing; fallback to ring buffer if busy/full
+          // Try to queue immediately; fallback to ring buffer if busy/full
           if (!SPIComm::queue_packet(event_data))
           {
             ringBuffer.push(event_data);
@@ -459,7 +463,7 @@ void shared_irq_handler()
 
         uint16_t event_data = SPIComm::create_encoder_switch_event(current_pressed);
 
-        // Attempt immediate SPI queueing; fallback to ring buffer if busy/full
+        // Try to queue immediately; fallback to ring buffer if busy/full
         if (!SPIComm::queue_packet(event_data))
         {
           ringBuffer.push(event_data);
@@ -472,6 +476,7 @@ void shared_irq_handler()
 
 }
 
+// Process deferred events, handle control commands, and manage LOGAN TX sequencing
 void process_buffered_events()
 {
   uint16_t event_data;
@@ -480,7 +485,7 @@ void process_buffered_events()
 
   SPIComm::update_transmission_status();
 
-  // Handle control commands atomically here
+  // Control commands
   if (g_stop_requested)
   {
     g_stop_requested = false;
@@ -554,7 +559,6 @@ void process_buffered_events()
           SPIComm::cancel_logan_transfer();
           g_logan_tx_sequence_active = false;
           g_logan_tx_next_channel = 1;
-          printf("LOGAN STOP received; sampling and transfer cancelled\r\n");
           g_rx_word = 0; // consume
         }
         else
@@ -592,52 +596,45 @@ void process_buffered_events()
 
           if (trig_mode_nib == 0)
           {
-            // Mode 0: Immediate start (no trigger)
+            // Mode 0: immediate start (no trigger)
             g_logan_sampling_active = true;
             g_logan_trigger_armed = false;
             add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-            printf("LOGAN ARM: ch=%u trig=%u (immediate) samples=%u words=%u rate_khz=%u interval_us=%lld\r\n",
-                   (unsigned)trig_channel,
-                   (unsigned)trig_mode_nib,
-                   (unsigned)sample_count,
-                   (unsigned)expected_words_clamped,
-                   (unsigned)rate_khz,
-                   (long long)interval_us);
           }
           else
           {
-            // Mode 1+: Triggered start
+            // Mode 1+: triggered start
             g_logan_sampling_active = false;
             g_logan_trigger_armed = true;
 
             // Configure trigger detection based on mode
             switch (trig_mode_nib)
             {
-              case 1: // LOW level
+              case 1: // Low level
                 g_logan_trigger_edge_rising = false;
                 g_logan_trigger_edge_falling = false;
                 g_logan_trigger_level_low = true;
                 g_logan_trigger_level_high = false;
                 break;
-              case 2: // HIGH level
+              case 2: // High level
                 g_logan_trigger_edge_rising = false;
                 g_logan_trigger_edge_falling = false;
                 g_logan_trigger_level_low = false;
                 g_logan_trigger_level_high = true;
                 break;
-              case 3: // RISING_EDGE
+              case 3: // Rising edge
                 g_logan_trigger_edge_rising = true;
                 g_logan_trigger_edge_falling = false;
                 g_logan_trigger_level_low = false;
                 g_logan_trigger_level_high = false;
                 break;
-              case 4: // FALLING_EDGE
+              case 4: // Falling edge
                 g_logan_trigger_edge_rising = false;
                 g_logan_trigger_edge_falling = true;
                 g_logan_trigger_level_low = false;
                 g_logan_trigger_level_high = false;
                 break;
-              case 5: // EITHER_EDGE
+              case 5: // Either edge
                 g_logan_trigger_edge_rising = true;
                 g_logan_trigger_edge_falling = true;
                 g_logan_trigger_level_low = false;
@@ -672,45 +669,21 @@ void process_buffered_events()
                 g_logan_sampling_active = true;
                 g_logan_sample_index = 0;
                 add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-
-                printf("LOGAN ARM: ch=%u trig=%u (level immediate) samples=%u words=%u rate_khz=%u interval_us=%lld\r\n",
-                       (unsigned)trig_channel,
-                       (unsigned)trig_mode_nib,
-                       (unsigned)sample_count,
-                       (unsigned)expected_words_clamped,
-                       (unsigned)rate_khz,
-                       (long long)interval_us);
               }
               else
               {
                 // Enable interrupts for level monitoring
                 uint32_t trigger_events = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
                 gpio_set_irq_enabled(trigger_pin, trigger_events, true);
-
-                printf("LOGAN ARM: ch=%u trig=%u (level armed) samples=%u words=%u rate_khz=%u interval_us=%lld armed=1\r\n",
-                       (unsigned)trig_channel,
-                       (unsigned)trig_mode_nib,
-                       (unsigned)sample_count,
-                       (unsigned)expected_words_clamped,
-                       (unsigned)rate_khz,
-                       (long long)interval_us);
               }
             }
             else
             {
-              // Edge triggers: enable appropriate edge interrupts
+              // For edge triggers, enable appropriate edge interrupts
               uint32_t trigger_events = 0;
               if (g_logan_trigger_edge_rising) trigger_events |= GPIO_IRQ_EDGE_RISE;
               if (g_logan_trigger_edge_falling) trigger_events |= GPIO_IRQ_EDGE_FALL;
               gpio_set_irq_enabled(trigger_pin, trigger_events, true);
-
-              printf("LOGAN ARM: ch=%u trig=%u (edge armed) samples=%u words=%u rate_khz=%u interval_us=%lld armed=1\r\n",
-                     (unsigned)trig_channel,
-                     (unsigned)trig_mode_nib,
-                     (unsigned)sample_count,
-                     (unsigned)expected_words_clamped,
-                     (unsigned)rate_khz,
-                     (long long)interval_us);
             }
           }
 
@@ -759,7 +732,7 @@ void process_buffered_events()
     sleep_us(50);
   }
 
-  // LOGAN multi-channel: when sampling finished, queue channel packets sequentially (1..4)
+  // LOGAN multi-channel: when sampling finishes, queue channel packets sequentially (1..4)
   if (g_logan_sampling_done || (g_logan_tx_sequence_active && !SPIComm::is_logan_transfer_busy()))
   {
     // Handle abort before starting/continuing sequence
@@ -773,7 +746,7 @@ void process_buffered_events()
       return;
     }
 
-    // If just completed sampling and TX is idle, start sequence at channel 1
+    // If sampling just completed and TX is idle, start sequence at channel 1
     if (g_logan_sampling_done && !SPIComm::is_logan_transfer_busy())
     {
       g_logan_sampling_done = false;
@@ -807,16 +780,6 @@ void process_buffered_events()
                                ((rate_nib   & 0x0F) << 0);
 
         SPIComm::configure_custom_header(header_word, payload_words);
-
-        if (LOGAN_DEBUG_PRINT)
-        {
-          printf("LOGAN CH%u HEADER: 0x%04X words=%u samples=%u\r\n",
-                 (unsigned)chan_num,
-                 header_word,
-                 (unsigned)payload_words,
-                 (unsigned)g_logan_sample_index);
-        }
-
         SPIComm::set_logan_payload(packed_words, payload_words);
         SPIComm::start_dummy_samples_transfer();
 
@@ -842,12 +805,6 @@ void process_buffered_events()
             int64_t interval_us = static_cast<int64_t>(1000 / rate_khz);
             if (interval_us <= 0) interval_us = 1;
             add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-            if (LOGAN_DEBUG_PRINT)
-            {
-              printf("LOGAN RE-ARM: immediate mode, rate_khz=%u interval_us=%lld\r\n",
-                     (unsigned)rate_khz,
-                     (long long)interval_us);
-            }
           }
           else
           {
@@ -880,42 +837,21 @@ void process_buffered_events()
                 int64_t interval_us = static_cast<int64_t>(1000 / rate_khz);
                 if (interval_us <= 0) interval_us = 1;
                 add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-
-                if (LOGAN_DEBUG_PRINT)
-                {
-                  printf("LOGAN RE-ARM: level trigger immediate, channel=%u mode=%u\r\n",
-                         (unsigned)g_logan_trigger_channel + 1,
-                         (unsigned)g_logan_trigger_mode);
-                }
               }
               else
               {
                 // Enable interrupts for level monitoring
                 uint32_t trigger_events = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
                 gpio_set_irq_enabled(trigger_pin, trigger_events, true);
-
-                if (LOGAN_DEBUG_PRINT)
-                {
-                  printf("LOGAN RE-ARM: level trigger armed, channel=%u mode=%u\r\n",
-                         (unsigned)g_logan_trigger_channel + 1,
-                         (unsigned)g_logan_trigger_mode);
-                }
               }
             }
             else
             {
-              // Edge triggers: re-enable trigger pin interrupts
+              // For edge triggers, re-enable trigger pin interrupts
               uint32_t trigger_events = 0;
               if (g_logan_trigger_edge_rising) trigger_events |= GPIO_IRQ_EDGE_RISE;
               if (g_logan_trigger_edge_falling) trigger_events |= GPIO_IRQ_EDGE_FALL;
               gpio_set_irq_enabled(trigger_pin, trigger_events, true);
-
-              if (LOGAN_DEBUG_PRINT)
-              {
-                printf("LOGAN RE-ARM: edge trigger armed, channel=%u mode=%u\r\n",
-                       (unsigned)g_logan_trigger_channel + 1,
-                       (unsigned)g_logan_trigger_mode);
-              }
             }
           }
         }
@@ -930,34 +866,34 @@ void process_buffered_events()
   }
 }
 
+// Configure PWM on the given pin to generate a stable test signal
 void setup_pwm(uint pin)
 {
-  // Configure GPIO for PWM function
+  // GPIO PWM function
   gpio_set_function(pin, GPIO_FUNC_PWM);
 
-  // Get PWM slice and channel numbers
+  // Compute slice and channel
   g_pwm_slice_num = pwm_gpio_to_slice_num(pin);
   g_pwm_channel = pwm_gpio_to_channel(pin);
 
-  // Calculate optimal PWM parameters for logic analyzer testing
+  // Compute PWM parameters for analyzer testing
   uint32_t sys_clk = clock_get_hz(clk_sys);  // System clock frequency (~125 MHz)
 
-  // Use a reasonable divider for stable operation
-  // Target: good resolution while avoiding overflow
+  // Divider targets good resolution while avoiding overflow
   float divider = 125.0f;  // 125 MHz / 125 = 1 MHz PWM base frequency
 
-  // Calculate wrap value for desired frequency
+  // Wrap for desired frequency
   uint32_t wrap = (uint32_t)((sys_clk / (divider * PWM_FREQ_HZ)) - 1);
 
-  // Ensure wrap value is reasonable (minimum 1, maximum 65535)
+  // Clamp wrap to [1, 65535]
   if (wrap < 1) wrap = 1;
   if (wrap > 65535) wrap = 65535;
 
-  // Set PWM configuration
+  // Apply PWM configuration
   pwm_set_clkdiv(g_pwm_slice_num, divider);
   pwm_set_wrap(g_pwm_slice_num, wrap);
 
-  // Set duty cycle (50% for clean clock signal)
+  // Duty cycle (50% for clean clock signal)
   uint32_t level = (uint32_t)(wrap * PWM_DUTY_CYCLE);
   pwm_set_chan_level(g_pwm_slice_num, g_pwm_channel, level);
 
@@ -965,21 +901,15 @@ void setup_pwm(uint pin)
   pwm_set_enabled(g_pwm_slice_num, PWM_ALWAYS_ENABLED);
 
   g_pwm_initialized = true;
-
-  printf("PWM initialized for LOGAN testing:\r\n");
-  printf("  Pin: %u, Slice: %u, Channel: %u\r\n", pin, g_pwm_slice_num, g_pwm_channel);
-  printf("  Frequency: %.1f Hz, Divider: %.1f, Wrap: %u, Level: %u\r\n",
-         PWM_FREQ_HZ, divider, wrap, level);
-  printf("  Duty Cycle: %.1f%%, Always Enabled: %s\r\n",
-         PWM_DUTY_CYCLE * 100.0f, PWM_ALWAYS_ENABLED ? "YES" : "NO");
 }
 
+// Validate whether a word matches the SNM event format (excludes LOGAN headers)
 bool is_snm_event(uint16_t word)
 {
   const uint8_t type = static_cast<uint8_t>((word >> 12) & 0x0F);
   if ((type & 0x8) != 0) return false; // exclude LOGAN headers
 
-  // Validate checksum against SNM packet format
+  // Check checksum per SNM packet format
   const uint8_t action   = static_cast<uint8_t>((word >> 8)  & 0x0F);
   const uint8_t value    = static_cast<uint8_t>((word >> 4)  & 0x0F);
   const uint8_t checksum = static_cast<uint8_t>( word        & 0x0F);
@@ -989,6 +919,7 @@ bool is_snm_event(uint16_t word)
   return checksum_ok && ((type >= 0x1 && type <= 0x3) || type == 0xA);
 }
 
+// Handle SNM announcement messages and send acknowledgments
 void handle_snm_announcement(uint16_t word)
 {
   const uint8_t type   = static_cast<uint8_t>((word >> 12) & 0x0F);
@@ -999,9 +930,7 @@ void handle_snm_announcement(uint16_t word)
   {
     if (value == 0x1) // SNM attached
     {
-      printf("SNM ANNOUNCE: Master attached\r\n");
-
-      // Send acknowledgment response
+      // Send acknowledgment
       uint16_t ack_response = SPIComm::create_snm_announce_event(true); // Echo back attached=true
       if (!SPIComm::queue_packet(ack_response))
       {
@@ -1011,9 +940,7 @@ void handle_snm_announcement(uint16_t word)
     }
     else if (value == 0x0) // Program stopping
     {
-      printf("SNM ANNOUNCE: Master stopping\r\n");
-
-      // Send acknowledgment response
+      // Send acknowledgment
       uint16_t ack_response = SPIComm::create_snm_announce_event(false); // Echo back attached=false
       if (!SPIComm::queue_packet(ack_response))
       {
@@ -1021,22 +948,23 @@ void handle_snm_announcement(uint16_t word)
       }
       request_led_blink();
 
-      // Trigger system stop - same as receiving STOP_CMD
+      // Trigger system stop (same as STOP_CMD)
       g_stop_requested = true;
     }
   }
 }
 
+// Evaluate trigger conditions and, when met, start LOGAN sampling
 void logan_trigger_handler()
 {
-  // Check if we're armed and waiting for trigger
+  // Only if armed and not already sampling
   if (!g_logan_trigger_armed || g_logan_sampling_active)
     return;
 
   uint8_t trigger_pin = LOGAN_PINS[g_logan_trigger_channel];
   bool trigger_condition_met = false;
 
-  // Handle edge-based triggers
+  // Edge-based triggers
   if (g_logan_trigger_edge_rising || g_logan_trigger_edge_falling)
   {
     uint32_t events = gpio_get_irq_event_mask(trigger_pin);
@@ -1047,19 +975,19 @@ void logan_trigger_handler()
 
       bool current_state = gpio_get(trigger_pin);
 
-      // Check trigger edge conditions
+      // Edge conditions
       if (current_state && g_logan_trigger_edge_rising)
         trigger_condition_met = true;
       else if (!current_state && g_logan_trigger_edge_falling)
         trigger_condition_met = true;
     }
   }
-  // Handle level-based triggers
+  // Level-based triggers
   else if (g_logan_trigger_level_low || g_logan_trigger_level_high)
   {
     bool current_state = gpio_get(trigger_pin);
 
-    // Check trigger level conditions
+    // Level conditions
     if (!current_state && g_logan_trigger_level_low)
       trigger_condition_met = true;
     else if (current_state && g_logan_trigger_level_high)
@@ -1068,7 +996,7 @@ void logan_trigger_handler()
 
   if (trigger_condition_met)
   {
-    // Start sampling immediately
+    // Start sampling
     g_logan_trigger_armed = false;
     g_logan_sampling_active = true;
     g_logan_sample_index = 0;
@@ -1083,9 +1011,6 @@ void logan_trigger_handler()
     if (interval_us <= 0) interval_us = 1;
 
     add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-
-    printf("LOGAN TRIGGER: Channel %u triggered (mode=%u), starting sampling at %u kHz\r\n",
-           g_logan_trigger_channel + 1, g_logan_trigger_mode, (unsigned)rate_khz);
   }
 }
 
