@@ -678,27 +678,19 @@ void process_buffered_events()
     }
     else
     {
-      // Check if this is an SNM event (including announcements)
-      if (is_snm_event(rx_snapshot))
-      {
-        const uint8_t type = static_cast<uint8_t>((rx_snapshot >> 12) & 0x0F);
-        if (type == 0xA) // SNM announcement
-        {
-          handle_snm_announcement(rx_snapshot);
-        }
-        // Other SNM events (macro keys, encoder) are handled by the existing event system
-        g_rx_word = 0; // consume the event
-        return;
-      }
-
       uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
       uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
 
-      // New LOGAN header: top bit of top nibble set
-      bool is_logan_cmd = ((rx_high_byte & 0x80) != 0);
-      if (is_logan_cmd && (rx_high_byte != 0x00 || rx_low_byte != 0x00))
+      // Prefer LOGAN header detection first, so single-shot (MSB=0) is not misread as SNM
+      bool msb_set = ((rx_high_byte & 0x80) != 0);
+      bool header_nonzero = (rx_high_byte != 0x00 || rx_low_byte != 0x00);
+      uint8_t type_nibble_peek = static_cast<uint8_t>((rx_high_byte >> 4) & 0x0F);
+      uint8_t chan_peek = static_cast<uint8_t>(type_nibble_peek & 0x07);
+      bool looks_like_logan = header_nonzero && (msb_set || (chan_peek >= 1 && chan_peek <= 4));
+      bool is_logan_cmd = looks_like_logan;
+      if (is_logan_cmd)
       {
-        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // 1ccc (c = channel 1..4)
+        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // bccc (b=MSB for mode, c = channel 1..4)
         uint8_t trig_mode_nib  =  rx_high_byte       & 0x0F;
         uint8_t samples_nibble = (rx_low_byte  >> 4) & 0x0F;
         uint8_t rate_nibble    =  rx_low_byte        & 0x0F;
@@ -741,7 +733,8 @@ void process_buffered_events()
           g_logan_sample_target  = sample_count;
           g_logan_sample_index   = 0;
           g_logan_sampling_done  = false;
-          g_logan_continuous      = true; // until explicit LOGAN STOP
+          // Continuous if MSB of type nibble set (cb_run_stop). Single-shot if MSB clear (cb_single)
+          g_logan_continuous      = msb_set;
           g_logan_abort_requested = false; // clear any previous abort
           g_logan_expected_words  = expected_words_clamped;
 
@@ -838,6 +831,17 @@ void process_buffered_events()
           g_rx_word = 0; // consume
         }
       }
+      else if (is_snm_event(rx_snapshot))
+      {
+        const uint8_t type = static_cast<uint8_t>((rx_snapshot >> 12) & 0x0F);
+        if (type == 0xA) // SNM announcement
+        {
+          handle_snm_announcement(rx_snapshot);
+        }
+        // Other SNM events (macro keys, encoder) are handled by the existing event system
+        g_rx_word = 0; // consume the event
+        return;
+      }
     }
   }
 
@@ -931,6 +935,27 @@ void process_buffered_events()
 
         SPIComm::configure_custom_header(header_word, payload_words);
         SPIComm::set_logan_payload(packed_words, payload_words);
+
+        // Single-shot verbose log: include config, header, payload, checksum
+        if (!g_logan_continuous)
+        {
+          printf("LOGAN CH%u TX (SINGLE) %u\n", (unsigned)chan_num, (unsigned)chan_num);
+          printf("CONFIG: trig_ch=%u mode=%u samplesNib=%u rateNib=%u\n",
+                 (unsigned)(g_logan_trigger_channel + 1),
+                 (unsigned)g_logan_trigger_mode,
+                 (unsigned)g_logan_samples_nibble,
+                 (unsigned)g_logan_rate_nibble);
+          printf("HEADER: 0x%04X\n", (unsigned)header_word);
+          printf("PAYLOAD: ");
+          uint16_t checksum = 0;
+          for (size_t i = 0; i < payload_words; ++i)
+          {
+            uint16_t w = packed_words[i];
+            checksum ^= w;
+            printf("0x%04X ", (unsigned)w);
+          }
+          printf("\nCHECKSUM: 0x%04X\n", (unsigned)checksum);
+        }
         g_logan_tx_inflight = true;
         g_logan_tx_inflight_channel = g_logan_tx_next_channel;
         SPIComm::start_dummy_samples_transfer();
@@ -1009,6 +1034,19 @@ void process_buffered_events()
               gpio_set_irq_enabled(trigger_pin, trigger_events, true);
             }
           }
+        }
+        else
+        {
+          // Single-shot: ensure we do not capture more samples until a new command
+          cancel_repeating_timer(&g_logan_timer);
+          g_logan_sampling_active = false;
+          g_logan_trigger_armed = false;
+          // Disable trigger pin interrupts to avoid spurious retriggers
+          uint8_t trigger_pin = LOGAN_PINS[g_logan_trigger_channel];
+          gpio_set_irq_enabled(trigger_pin, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+          // Reset indices; host must re-arm explicitly to capture again
+          g_logan_sample_index = 0;
+          printf("LOGAN TX COMPLETE (SINGLE)\n");
         }
       }
     }
