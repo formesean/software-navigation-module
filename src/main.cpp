@@ -311,21 +311,28 @@ bool logan_timer_callback(repeating_timer_t *rt)
     }
     else if (!g_logan_triggered && g_logan_trigger_mode == 0)
     {
-      // Immediate mode with pre-trigger configured: treat as triggered on first tick
+      // Immediate mode: treat as triggered on first tick
       // This makes the pre-trigger region represent initial history (zeros if empty)
       // and aligns trigger at the first sample
-      size_t pre_to_copy = g_logan_pre_count;
-      size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % (g_logan_pre_capacity == 0 ? 1 : g_logan_pre_capacity);
       size_t dst = 0;
-      for (size_t i = 0; i < pre_to_copy && dst < g_logan_sample_target; ++i)
+
+      // Copy pre-trigger samples if any exist
+      if (g_logan_pre_capacity > 0)
       {
-        size_t src = (start_idx + i) % (g_logan_pre_capacity == 0 ? 1 : g_logan_pre_capacity);
-        for (uint8_t ch = 0; ch < 4; ++ch)
+        size_t pre_to_copy = g_logan_pre_count;
+        size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % g_logan_pre_capacity;
+        for (size_t i = 0; i < pre_to_copy && dst < g_logan_sample_target; ++i)
         {
-          g_logan_sample_buffer[ch][dst] = g_logan_pre_ring[ch][src];
+          size_t src = (start_idx + i) % g_logan_pre_capacity;
+          for (uint8_t ch = 0; ch < 4; ++ch)
+          {
+            g_logan_sample_buffer[ch][dst] = g_logan_pre_ring[ch][src];
+          }
+          dst++;
         }
-        dst++;
       }
+
+      // Place the trigger sample itself
       if (dst < g_logan_sample_target)
       {
         for (uint8_t ch = 0; ch < 4; ++ch)
