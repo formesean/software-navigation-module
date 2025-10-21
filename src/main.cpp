@@ -223,11 +223,17 @@ static inline void logan_capture_sample_now()
     return;
   }
 
-  for (uint8_t ch = 0; ch < 4; ++ch)
-  {
-    uint16_t sample = static_cast<uint16_t>(gpio_get(LOGAN_PINS[ch]) & 0x1);
-    g_logan_sample_buffer[ch][g_logan_sample_index] = sample;
-  }
+  // === MODIFICATION START ===
+  // Read all pins at once to ensure a simultaneous snapshot
+  uint32_t all_pins = gpio_get_all();
+
+  // Extract samples for each channel using the pin definitions
+  g_logan_sample_buffer[0][g_logan_sample_index] = (all_pins >> LOGAN_PINS[0]) & 0x1;
+  g_logan_sample_buffer[1][g_logan_sample_index] = (all_pins >> LOGAN_PINS[1]) & 0x1;
+  g_logan_sample_buffer[2][g_logan_sample_index] = (all_pins >> LOGAN_PINS[2]) & 0x1;
+  g_logan_sample_buffer[3][g_logan_sample_index] = (all_pins >> LOGAN_PINS[3]) & 0x1;
+  // === MODIFICATION END ===
+
   g_logan_sample_index++;
 
   if (g_logan_sample_index >= g_logan_sample_target)
@@ -244,12 +250,17 @@ bool logan_timer_callback(repeating_timer_t *rt)
 {
   if (!g_logan_sampling_active) return false;
 
-  // Snapshot all channels exactly once for this tick
+  // === MODIFICATION START ===
+  // Snapshot all channels simultaneously by reading the entire GPIO register at once.
+  // This is atomic and prevents skew from interrupts firing between sequential reads.
+  uint32_t all_pins = gpio_get_all();
   uint8_t snapshot[4];
-  for (uint8_t ch = 0; ch < 4; ++ch)
-  {
-    snapshot[ch] = static_cast<uint8_t>(gpio_get(LOGAN_PINS[ch]) & 0x1);
-  }
+  snapshot[0] = (all_pins >> LOGAN_PINS[0]) & 0x1;
+  snapshot[1] = (all_pins >> LOGAN_PINS[1]) & 0x1;
+  snapshot[2] = (all_pins >> LOGAN_PINS[2]) & 0x1;
+  snapshot[3] = (all_pins >> LOGAN_PINS[3]) & 0x1;
+  // === MODIFICATION END ===
+
 
   // If pre-trigger enabled and not triggered yet, fill ring and check trigger
   if (!g_logan_triggered && g_logan_pre_capacity > 0)
@@ -358,8 +369,13 @@ bool logan_timer_callback(repeating_timer_t *rt)
   {
     if (g_logan_sample_index < g_logan_sample_target)
     {
-      for (uint8_t ch = 0; ch < 4; ++ch)
-        g_logan_sample_buffer[ch][g_logan_sample_index] = snapshot[ch];
+      // === MODIFICATION START ===
+      // Store the simultaneous snapshot
+      g_logan_sample_buffer[0][g_logan_sample_index] = snapshot[0];
+      g_logan_sample_buffer[1][g_logan_sample_index] = snapshot[1];
+      g_logan_sample_buffer[2][g_logan_sample_index] = snapshot[2];
+      g_logan_sample_buffer[3][g_logan_sample_index] = snapshot[3];
+      // === MODIFICATION END ===
       g_logan_sample_index++;
     }
   }
