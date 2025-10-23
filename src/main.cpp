@@ -19,25 +19,6 @@ const uint8_t ENCODER_SW = 2;
 const uint8_t ENCODER_DT = 3;
 const uint8_t ENCODER_CLK = 4;
 const uint8_t LED_PIN = 25;
-const uint8_t PWM_PIN = 15;
-
-// PWM Configuration for Logic Analyzer Testing
-// 100 Hz   → PWM_FREQ_HZ = 37.0f
-// 60 Hz  → PWM_FREQ_HZ = 23.0f
-// 50 Hz  → PWM_FREQ_HZ = 19.0f
-// 20 Hz  → PWM_FREQ_HZ = 17.0f
-// 10 Hz  → PWM_FREQ_HZ = 16.0f
-// 5 Hz   → PWM_FREQ_HZ = 16.0f
-// 2 Hz   → PWM_FREQ_HZ = 16.0f
-// 1 Hz   → PWM_FREQ_HZ = 16.0f
-const float PWM_FREQ_HZ = 37.0f;
-const float PWM_DUTY_CYCLE = 0.5f;
-const bool PWM_ALWAYS_ENABLED = true;
-
-// PWM state tracking
-static uint g_pwm_slice_num = 0;
-static uint g_pwm_channel = 0;
-static volatile bool g_pwm_initialized = false;
 
 // Global state
 RingBuffer ringBuffer;
@@ -82,7 +63,6 @@ void request_led_blink();
 void shared_irq_handler();
 void process_buffered_events();
 void initialize_pin_states();
-void setup_pwm(uint pin);
 void reset_system_state();
 bool is_snm_event(uint16_t word);
 void handle_snm_announcement(uint16_t word);
@@ -93,7 +73,7 @@ static repeating_timer_t g_logan_timer;
 static volatile bool g_logan_sampling_active = false;
 static volatile bool g_logan_sampling_done = false;
 static volatile size_t g_logan_sample_target = 0;
-static volatile size_t g_logan_requested_samples = 0; // requested sample count from header (for TX windowing)
+static volatile size_t g_logan_requested_samples = 0;
 static volatile size_t g_logan_sample_index = 0;
 static uint16_t g_logan_sample_buffer[4][2000];
 static volatile uint8_t g_logan_samples_nibble = 0;
@@ -104,13 +84,13 @@ static volatile bool g_logan_abort_requested = false;
 
 // LOGAN: multi-channel transmit sequencing state
 static volatile bool g_logan_tx_sequence_active = false;
-static volatile uint8_t g_logan_tx_next_channel = 1; // 1..4
+static volatile uint8_t g_logan_tx_next_channel = 1;
 
 // LOGAN: minimal timing/tx state (debug logging removed)
 static volatile absolute_time_t g_logan_sampling_start_time = 0;
 static volatile absolute_time_t g_logan_sampling_end_time = 0;
 static volatile bool g_logan_tx_inflight = false;
-static volatile uint8_t g_logan_tx_inflight_channel = 0; // 1..4 display only
+static volatile uint8_t g_logan_tx_inflight_channel = 0;
 
 // LOGAN: trigger configuration/state
 static volatile bool g_logan_trigger_armed = false;
@@ -121,15 +101,15 @@ static volatile bool g_logan_trigger_edge_falling = true;
 static volatile bool g_logan_trigger_level_low = false;
 static volatile bool g_logan_trigger_level_high = false;
 
-// LOGAN: pre-trigger capture state (timer-driven trigger inside sampling)
+// LOGAN: pre-trigger capture state
 static constexpr size_t PRETRIGGER_MAX = 1000;
-static volatile size_t g_logan_pre_capacity = 0;      // desired pre-trigger samples
-static volatile size_t g_logan_pre_count = 0;          // current fill level
-static volatile size_t g_logan_pre_wr_index = 0;       // ring write index
+static volatile size_t g_logan_pre_capacity = 0;
+static volatile size_t g_logan_pre_count = 0;
+static volatile size_t g_logan_pre_wr_index = 0;
 static uint8_t g_logan_pre_ring[4][PRETRIGGER_MAX] = {};
-static volatile bool g_logan_triggered = false;        // trigger has fired
-static volatile size_t g_logan_trigger_index = 0;      // index in final buffer where trigger sample was placed
-static volatile bool g_logan_prev_trig_level = false;  // previous level of trigger pin for edge detection
+static volatile bool g_logan_triggered = false;
+static volatile size_t g_logan_trigger_index = 0;
+static volatile bool g_logan_prev_trig_level = false;
 
 // Harden payload words so they cannot be misread as SNM events by the host.
 // If top nibble is 0x1 and checksum nibble equals type^action^value, flip bit 1
@@ -161,15 +141,10 @@ static inline uint16_t harden_payload_word(uint16_t w)
 // Mapping: 0 -> 0x0, 1 -> 0x9 (1001b). Host should read (nibble & 0x1).
 static inline uint16_t encode_sample_nibble(uint16_t sample)
 {
-  // Map '1' to 0x5 (0101b): avoids SNM type nibbles (1..3, 0xA) and
-  // ensures the MSB nibble of any payload word is always < 0x8 so it
-  // cannot be mistaken for a LOGAN header (which uses 1ccc >= 0x8).
   return (sample & 0x1) ? 0x5 : 0x0;
 }
 
-// Pack raw 1-bit samples (0/1) into 16-bit words (nibbles), MSB-first per word.
-// The first word carries the remainder (N % 4) samples in its high nibbles;
-// subsequent words carry full 4-sample groups with sample0 in [15:12], sample1 in [11:8], etc.
+// Pack raw 1-bit samples (0/1) into 16-bit words (nibbles), MSB-first per word
 static size_t pack_samples_to_words(const uint16_t *in_samples, size_t sample_count, uint16_t *out_words, size_t out_capacity)
 {
   if (sample_count == 0) return 0;
@@ -222,9 +197,6 @@ static inline void logan_capture_sample_now()
     g_logan_sampling_end_time = get_absolute_time();
     return;
   }
-
-  // === MODIFICATION START ===
-  // Read all pins at once to ensure a simultaneous snapshot
   uint32_t all_pins = gpio_get_all();
 
   // Extract samples for each channel using the pin definitions
@@ -232,7 +204,6 @@ static inline void logan_capture_sample_now()
   g_logan_sample_buffer[1][g_logan_sample_index] = (all_pins >> LOGAN_PINS[1]) & 0x1;
   g_logan_sample_buffer[2][g_logan_sample_index] = (all_pins >> LOGAN_PINS[2]) & 0x1;
   g_logan_sample_buffer[3][g_logan_sample_index] = (all_pins >> LOGAN_PINS[3]) & 0x1;
-  // === MODIFICATION END ===
 
   g_logan_sample_index++;
 
@@ -250,16 +221,13 @@ bool logan_timer_callback(repeating_timer_t *rt)
 {
   if (!g_logan_sampling_active) return false;
 
-  // === MODIFICATION START ===
   // Snapshot all channels simultaneously by reading the entire GPIO register at once.
-  // This is atomic and prevents skew from interrupts firing between sequential reads.
   uint32_t all_pins = gpio_get_all();
   uint8_t snapshot[4];
   snapshot[0] = (all_pins >> LOGAN_PINS[0]) & 0x1;
   snapshot[1] = (all_pins >> LOGAN_PINS[1]) & 0x1;
   snapshot[2] = (all_pins >> LOGAN_PINS[2]) & 0x1;
   snapshot[3] = (all_pins >> LOGAN_PINS[3]) & 0x1;
-  // === MODIFICATION END ===
 
 
   // If pre-trigger enabled and not triggered yet, fill ring and check trigger
@@ -399,7 +367,6 @@ int main()
   wait_for_usb_connect();
   setup_pins();
   initialize_pin_states();
-  setup_pwm(PWM_PIN);
   SPIComm::init_slave();
 
   encoder_last_state = (gpio_get(ENCODER_CLK) << 1) | gpio_get(ENCODER_DT);
@@ -804,11 +771,6 @@ void process_buffered_events()
           g_logan_trigger_index = 0;
           g_logan_prev_trig_level = static_cast<bool>(gpio_get(LOGAN_PINS[trig_index]));
 
-          // Diagnostic: print concise config received
-          printf("LOGAN cfg rx: trig_ch=%u mode=%u samplesNib=%u rateNib=%u\n",
-                 (unsigned)(trig_chan_1to4), (unsigned)trig_mode_nib,
-                 (unsigned)samples_nibble, (unsigned)rate_nibble);
-
           // Configure trigger based on trigger mode
           // If continuous mode, ignore trigger settings to avoid alignment
           if (g_logan_continuous)
@@ -959,7 +921,6 @@ void process_buffered_events()
       g_logan_sample_target = 0;
       g_logan_expected_words = 0;
       g_logan_tx_sequence_active = false;
-      printf("LOGAN sampling aborted.\n");
       return;
     }
 
@@ -1018,26 +979,6 @@ void process_buffered_events()
         SPIComm::configure_custom_header(header_word, payload_words);
         SPIComm::set_logan_payload(packed_words, payload_words);
 
-        // Single-shot verbose log: include config, header, payload, checksum
-        if (!g_logan_continuous)
-        {
-          printf("LOGAN CH%u TX (SINGLE) %u\n", (unsigned)chan_num, (unsigned)chan_num);
-          printf("CONFIG: trig_ch=%u mode=%u samplesNib=%u rateNib=%u\n",
-                 (unsigned)(g_logan_trigger_channel + 1),
-                 (unsigned)g_logan_trigger_mode,
-                 (unsigned)g_logan_samples_nibble,
-                 (unsigned)g_logan_rate_nibble);
-          printf("HEADER: 0x%04X\n", (unsigned)header_word);
-          printf("PAYLOAD: ");
-          uint16_t checksum = 0;
-          for (size_t i = 0; i < payload_words; ++i)
-          {
-            uint16_t w = packed_words[i];
-            checksum ^= w;
-            printf("0x%04X ", (unsigned)w);
-          }
-          printf("\nCHECKSUM: 0x%04X\n", (unsigned)checksum);
-        }
         g_logan_tx_inflight = true;
         g_logan_tx_inflight_channel = g_logan_tx_next_channel;
         SPIComm::start_dummy_samples_transfer();
@@ -1078,50 +1019,12 @@ void process_buffered_events()
           gpio_set_irq_enabled(trigger_pin, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
           // Reset indices; host must re-arm explicitly to capture again
           g_logan_sample_index = 0;
-          printf("LOGAN TX COMPLETE (SINGLE)\n");
         }
       }
     }
   }
 
   // no periodic debug
-}
-
-// Configure PWM on the given pin to generate a stable test signal
-void setup_pwm(uint pin)
-{
-  // GPIO PWM function
-  gpio_set_function(pin, GPIO_FUNC_PWM);
-
-  // Compute slice and channel
-  g_pwm_slice_num = pwm_gpio_to_slice_num(pin);
-  g_pwm_channel = pwm_gpio_to_channel(pin);
-
-  // Compute PWM parameters for analyzer testing
-  uint32_t sys_clk = clock_get_hz(clk_sys);  // System clock frequency (~125 MHz)
-
-  // Divider targets good resolution while avoiding overflow
-  float divider = 125.0f;  // 125 MHz / 125 = 1 MHz PWM base frequency
-
-  // Wrap for desired frequency
-  uint32_t wrap = (uint32_t)((sys_clk / (divider * PWM_FREQ_HZ)) - 1);
-
-  // Clamp wrap to [1, 65535]
-  if (wrap < 1) wrap = 1;
-  if (wrap > 65535) wrap = 65535;
-
-  // Apply PWM configuration
-  pwm_set_clkdiv(g_pwm_slice_num, divider);
-  pwm_set_wrap(g_pwm_slice_num, wrap);
-
-  // Duty cycle (50% for clean clock signal)
-  uint32_t level = (uint32_t)(wrap * PWM_DUTY_CYCLE);
-  pwm_set_chan_level(g_pwm_slice_num, g_pwm_channel, level);
-
-  // Always enable PWM for consistent testing
-  pwm_set_enabled(g_pwm_slice_num, PWM_ALWAYS_ENABLED);
-
-  g_pwm_initialized = true;
 }
 
 // Validate whether a word matches the SNM event format (excludes LOGAN headers)
@@ -1220,9 +1123,6 @@ void logan_trigger_handler()
     g_logan_sampling_active = true;
     g_logan_sample_index = 0;
     g_logan_sampling_start_time = get_absolute_time();
-
-    // Diagnostic: print which channel fired
-    printf("LOGAN trigger fired on ch=%u\n", (unsigned)(g_logan_trigger_channel + 1));
 
     // Disable trigger pin interrupts temporarily
     gpio_set_irq_enabled(trigger_pin, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
