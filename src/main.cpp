@@ -3,7 +3,6 @@
 #include <hardware/gpio.h>
 #include <hardware/irq.h>
 #include <hardware/sync.h>
-#include <hardware/pwm.h>
 #include <hardware/clocks.h>
 #include <stdio.h>
 #include <cstdint>
@@ -360,7 +359,7 @@ bool logan_timer_callback(repeating_timer_t *rt)
   return true;
 }
 
-// Program entry point: initializes IO, IRQs, PWM test output, SPI slave, and runs event loop
+// Program entry point: initializes IO, IRQs, SPI slave, and runs event loop
 int main()
 {
   stdio_init_all();
@@ -467,7 +466,7 @@ void request_led_blink()
   led_blink_requested = true;
 }
 
-// Reset runtime state: SPI queues, buffers, input tracking, LOGAN sampling/trigger, and PWM enable
+// Reset runtime state: SPI queues, buffers, input tracking, LOGAN sampling/trigger
 void reset_system_state()
 {
   SPIComm::reset_state();
@@ -513,12 +512,6 @@ void reset_system_state()
   for (uint8_t ch = 0; ch < 4; ++ch)
   {
     gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-  }
-
-  // Ensure PWM remains enabled for testing (always on)
-  if (g_pwm_initialized)
-  {
-    pwm_set_enabled(g_pwm_slice_num, PWM_ALWAYS_ENABLED);
   }
 }
 
