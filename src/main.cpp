@@ -229,51 +229,45 @@ bool logan_timer_callback(repeating_timer_t *rt)
   snapshot[3] = (all_pins >> LOGAN_PINS[3]) & 0x1;
 
 
-  // If pre-trigger enabled and not triggered yet, fill ring and check trigger
+  // If pre-trigger enabled and not triggered yet, manage ring and check trigger
   if (!g_logan_triggered && g_logan_pre_capacity > 0)
   {
-    // Push into pre-trigger ring
-    for (uint8_t ch = 0; ch < 4; ++ch)
+    // If ring not yet full, push snapshot and continue
+    if (g_logan_pre_count < g_logan_pre_capacity)
     {
-      if (g_logan_pre_capacity > 0)
+      for (uint8_t ch = 0; ch < 4; ++ch)
       {
         g_logan_pre_ring[ch][g_logan_pre_wr_index] = snapshot[ch];
       }
-    }
-    if (g_logan_pre_count < g_logan_pre_capacity) g_logan_pre_count++;
-    g_logan_pre_wr_index = (g_logan_pre_wr_index + 1) % (g_logan_pre_capacity == 0 ? 1 : g_logan_pre_capacity);
-
-    // Wait until pre-trigger buffer is full before evaluating trigger
-    if (g_logan_pre_count < g_logan_pre_capacity)
-    {
-      // Still filling pre-trigger buffer; continue sampling without triggering
+      if (g_logan_pre_count < g_logan_pre_capacity) g_logan_pre_count++;
+      g_logan_pre_wr_index = (g_logan_pre_wr_index + 1) % g_logan_pre_capacity;
+      g_logan_prev_trig_level = snapshot[g_logan_trigger_channel] != 0;
       return true;
     }
 
-    // Evaluate trigger on the configured channel
+    // Ring full: evaluate trigger on the configured channel BEFORE pushing snapshot
     bool trig_now = snapshot[g_logan_trigger_channel] != 0;
     bool fire = false;
     if (g_logan_trigger_edge_rising && !g_logan_prev_trig_level && trig_now) fire = true;
     if (g_logan_trigger_edge_falling && g_logan_prev_trig_level && !trig_now) fire = true;
     if (g_logan_trigger_level_high && trig_now) fire = true;
     if (g_logan_trigger_level_low && !trig_now) fire = true;
-    g_logan_prev_trig_level = trig_now;
 
     if (!g_logan_trigger_armed && g_logan_trigger_mode != 0)
     {
-      // in case of immediate mode wrongly set, keep armed state coherent
+      // keep armed state coherent
       g_logan_trigger_armed = true;
     }
 
     if (g_logan_trigger_armed && fire)
     {
-      // Assemble final buffer: copy pre-trigger from ring (oldest first)
-      size_t pre_to_copy = g_logan_pre_count;
-      size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % (g_logan_pre_capacity == 0 ? 1 : g_logan_pre_capacity);
+      // Copy exactly the pre-trigger window from ring (oldest first)
+      size_t pre_to_copy = g_logan_pre_capacity;
+      size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % g_logan_pre_capacity;
       size_t dst = 0;
       for (size_t i = 0; i < pre_to_copy && dst < g_logan_sample_target; ++i)
       {
-        size_t src = (start_idx + i) % (g_logan_pre_capacity == 0 ? 1 : g_logan_pre_capacity);
+        size_t src = (start_idx + i) % g_logan_pre_capacity;
         for (uint8_t ch = 0; ch < 4; ++ch)
         {
           g_logan_sample_buffer[ch][dst] = g_logan_pre_ring[ch][src];
@@ -281,44 +275,42 @@ bool logan_timer_callback(repeating_timer_t *rt)
         dst++;
       }
 
-      // Place the trigger sample itself
+      // Place the trigger sample itself from current snapshot
       if (dst < g_logan_sample_target)
       {
         for (uint8_t ch = 0; ch < 4; ++ch)
           g_logan_sample_buffer[ch][dst] = snapshot[ch];
-        g_logan_trigger_index = dst; // mark trigger location
+        g_logan_trigger_index = dst;
         dst++;
       }
 
-      // Switch to post-trigger capture state
+      // Switch to post-trigger capture state; do not push this snapshot to ring
       g_logan_triggered = true;
       g_logan_trigger_armed = false;
       g_logan_sample_index = dst;
+      g_logan_prev_trig_level = trig_now;
+
+      // Skip generic storage for this tick to avoid duplicating the trigger sample
+      // Continue timer to collect post-trigger samples on subsequent ticks
+      // Return here so the below generic storage block is bypassed for this cycle
+      // (completion check will occur on a later tick)
+      return true;
     }
     else if (!g_logan_triggered && g_logan_trigger_mode == 0)
     {
-      // Immediate mode: treat as triggered on first tick
-      // This makes the pre-trigger region represent initial history (zeros if empty)
-      // and aligns trigger at the first sample
+      // Immediate mode: treat as triggered on first tick with ring full
       size_t dst = 0;
-
-      // Copy pre-trigger samples if any exist
-      if (g_logan_pre_capacity > 0)
+      size_t pre_to_copy = g_logan_pre_capacity;
+      size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % g_logan_pre_capacity;
+      for (size_t i = 0; i < pre_to_copy && dst < g_logan_sample_target; ++i)
       {
-        size_t pre_to_copy = g_logan_pre_count;
-        size_t start_idx = (g_logan_pre_wr_index + (g_logan_pre_capacity - pre_to_copy)) % g_logan_pre_capacity;
-        for (size_t i = 0; i < pre_to_copy && dst < g_logan_sample_target; ++i)
+        size_t src = (start_idx + i) % g_logan_pre_capacity;
+        for (uint8_t ch = 0; ch < 4; ++ch)
         {
-          size_t src = (start_idx + i) % g_logan_pre_capacity;
-          for (uint8_t ch = 0; ch < 4; ++ch)
-          {
-            g_logan_sample_buffer[ch][dst] = g_logan_pre_ring[ch][src];
-          }
-          dst++;
+          g_logan_sample_buffer[ch][dst] = g_logan_pre_ring[ch][src];
         }
+        dst++;
       }
-
-      // Place the trigger sample itself
       if (dst < g_logan_sample_target)
       {
         for (uint8_t ch = 0; ch < 4; ++ch)
@@ -328,6 +320,19 @@ bool logan_timer_callback(repeating_timer_t *rt)
       }
       g_logan_triggered = true;
       g_logan_sample_index = dst;
+      g_logan_prev_trig_level = trig_now;
+      return true;
+    }
+    else
+    {
+      // Not fired this tick: push snapshot into ring and continue
+      for (uint8_t ch = 0; ch < 4; ++ch)
+      {
+        g_logan_pre_ring[ch][g_logan_pre_wr_index] = snapshot[ch];
+      }
+      g_logan_pre_wr_index = (g_logan_pre_wr_index + 1) % g_logan_pre_capacity;
+      g_logan_prev_trig_level = trig_now;
+      return true;
     }
   }
 
@@ -519,9 +524,6 @@ void reset_system_state()
 void shared_irq_handler()
 {
   absolute_time_t now = get_absolute_time();
-
-  // LOGAN trigger first (highest priority)
-  logan_trigger_handler();
 
   // Handle macro keys
   for (int i = 0; i < 5; ++i)
@@ -721,16 +723,8 @@ void process_buffered_events()
 
           g_logan_samples_nibble = samples_nibble;
           g_logan_rate_nibble    = rate_nibble;
-          // For single-shot with a trigger, capture up to 2x to allow centered windowing
-          if (!msb_set && trig_mode_nib != 0)
-          {
-            size_t doubled = requested_samples * 2;
-            g_logan_sample_target = (doubled > max_samples) ? max_samples : doubled;
-          }
-          else
-          {
-            g_logan_sample_target = requested_samples;
-          }
+          // Capture exactly the requested window length
+          g_logan_sample_target = requested_samples;
           g_logan_requested_samples = requested_samples;
           g_logan_sample_index   = 0;
           g_logan_sampling_done  = false;
@@ -751,7 +745,20 @@ void process_buffered_events()
           }
           else if (!msb_set && trig_mode_nib != 0)
           {
-            g_logan_pre_capacity = (requested_samples / 2);
+            // For triggered single-shot, choose pre-trigger so that the trigger sample
+            // lands at index N/2 - 1 for even N (matching GUI 0 s placement)
+            size_t pre = requested_samples / 2;
+            if ((requested_samples % 2) == 0)
+            {
+              if (pre > 0) pre -= 1; // shift one left for even counts
+            }
+
+            if (pre == 0 && requested_samples > 0)
+            {
+                pre = 1;
+            }
+
+            g_logan_pre_capacity = pre;
             if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
           }
           else
@@ -938,17 +945,11 @@ void process_buffered_events()
         size_t window_len = (g_logan_requested_samples > 0) ? g_logan_requested_samples : available_samples;
         if (window_len > available_samples) window_len = available_samples;
         size_t start_idx = 0;
-        // Center window for both triggered and immediate single-shot modes
-        if (!g_logan_continuous && available_samples > 0 && window_len > 0)
+        // Single-shot: transmit the assembled buffer from index 0 exactly
+        if (!g_logan_continuous)
         {
-          size_t half = window_len / 2;
-          size_t desired_start = (g_logan_trigger_index > half) ? (g_logan_trigger_index - half) : 0;
-          if (desired_start + window_len > available_samples)
-          {
-            if (available_samples > window_len) desired_start = available_samples - window_len;
-            else desired_start = 0;
-          }
-          start_idx = desired_start;
+          start_idx = 0;
+          if (window_len > available_samples) window_len = available_samples;
         }
 
         // Pack raw 0/1 samples from selected window into nibble-packed 16-bit words for this channel
@@ -1126,10 +1127,8 @@ void logan_trigger_handler()
     int64_t interval_us = (int64_t)((1000000 + (rate_hz / 2)) / rate_hz);
     if (interval_us <= 0) interval_us = 1;
 
-    // Take the first sample exactly at the trigger edge to minimize phase error
-    logan_capture_sample_now();
-
-    // Schedule subsequent samples at precise intervals
+    // Schedule sampling; pre-trigger logic in the timer will place the trigger sample
+    // using the current tick's snapshot without duplicating
     add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
   }
 }
