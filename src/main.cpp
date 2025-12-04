@@ -738,14 +738,14 @@ void process_buffered_events()
           // - Immediate mode: pre-trigger = half window
           // - Single-shot triggered: enable pre-trigger = half window to center trigger
           // - Continuous: no pre-trigger
-          if (trig_mode_nib == 0 && !msb_set)
+          if (trig_mode_nib == 0)
           {
             g_logan_pre_capacity = (requested_samples / 2);
             if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
           }
-          else if (!msb_set && trig_mode_nib != 0)
+          else
           {
-            // For triggered single-shot, choose pre-trigger so that the trigger sample
+            // For triggered captures, choose pre-trigger so that the trigger sample
             // lands at index N/2 - 1 for even N (matching GUI 0 s placement)
             size_t pre = requested_samples / 2;
             if ((requested_samples % 2) == 0)
@@ -761,98 +761,79 @@ void process_buffered_events()
             g_logan_pre_capacity = pre;
             if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
           }
-          else
-          {
-            g_logan_pre_capacity = 0;
-          }
           g_logan_pre_count = 0;
           g_logan_pre_wr_index = 0;
           g_logan_triggered = false;
           g_logan_trigger_index = 0;
           g_logan_prev_trig_level = static_cast<bool>(gpio_get(LOGAN_PINS[trig_index]));
 
-          // Configure trigger based on trigger mode
-          // If continuous mode, ignore trigger settings to avoid alignment
-          if (g_logan_continuous)
+          // Configure trigger settings for both single-shot and continuous modes
+          g_logan_trigger_mode = trig_mode_nib;
+          g_logan_trigger_channel = trig_index; // 0-based index into LOGAN_PINS
+
+          // Disable any existing trigger interrupts
+          for (uint8_t ch = 0; ch < 4; ++ch)
           {
-            // Continuous mode: force immediate mode to avoid trigger alignment
-            g_logan_trigger_mode = 0;
-            g_logan_trigger_channel = 0;
+            gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+          }
+
+          g_logan_sampling_active = true;
+
+          if (trig_mode_nib == 0)
+          {
+            // Mode 0: immediate start (no trigger)
             g_logan_trigger_armed = false;
-            g_logan_sampling_active = true;
             g_logan_sampling_start_time = get_absolute_time();
-            add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
           }
           else
           {
-            // Single-shot mode: use trigger settings as configured
-            g_logan_trigger_mode = trig_mode_nib;
-            g_logan_trigger_channel = trig_index; // 0-based index into LOGAN_PINS
+            // Mode 1+: triggered start (pre-trigger ring handled in timer)
+            g_logan_trigger_armed = true;
 
-            // Disable any existing trigger interrupts
-            for (uint8_t ch = 0; ch < 4; ++ch)
+            // Configure trigger detection based on mode (for edge/level semantics)
+            switch (trig_mode_nib)
             {
-              gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
-            }
-
-            if (trig_mode_nib == 0)
-            {
-              // Mode 0: immediate start (no trigger)
-              g_logan_sampling_active = true;
-              g_logan_trigger_armed = false;
-              g_logan_sampling_start_time = get_absolute_time();
-              add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-            }
-            else
-            {
-              // Mode 1+: triggered start
-              g_logan_sampling_active = true;   // timer runs and handles pre-trigger ring
-              g_logan_trigger_armed = true;     // internal trigger inside timer
-
-              // Configure trigger detection based on mode (for edge/level semantics)
-              switch (trig_mode_nib)
-              {
-                case 1: // Low level
-                  g_logan_trigger_edge_rising = false;
-                  g_logan_trigger_edge_falling = false;
-                  g_logan_trigger_level_low = true;
-                  g_logan_trigger_level_high = false;
-                  break;
-                case 2: // High level
-                  g_logan_trigger_edge_rising = false;
-                  g_logan_trigger_edge_falling = false;
-                  g_logan_trigger_level_low = false;
-                  g_logan_trigger_level_high = true;
-                  break;
-                case 3: // Rising edge
-                  g_logan_trigger_edge_rising = true;
-                  g_logan_trigger_edge_falling = false;
-                  g_logan_trigger_level_low = false;
-                  g_logan_trigger_level_high = false;
-                  break;
-                case 4: // Falling edge
-                  g_logan_trigger_edge_rising = false;
-                  g_logan_trigger_edge_falling = true;
-                  g_logan_trigger_level_low = false;
-                  g_logan_trigger_level_high = false;
-                  break;
-                case 5: // Either edge
-                  g_logan_trigger_edge_rising = true;
-                  g_logan_trigger_edge_falling = true;
-                  g_logan_trigger_level_low = false;
-                  g_logan_trigger_level_high = false;
-                  break;
-                default: // Default to rising edge
-                  g_logan_trigger_edge_rising = true;
-                  g_logan_trigger_edge_falling = false;
-                  g_logan_trigger_level_low = false;
-                  g_logan_trigger_level_high = false;
-                  break;
-              }
-              // Start periodic sampling; trigger alignment happens inside timer
-              add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
+              case 1: // Low level
+                g_logan_trigger_edge_rising = false;
+                g_logan_trigger_edge_falling = false;
+                g_logan_trigger_level_low = true;
+                g_logan_trigger_level_high = false;
+                break;
+              case 2: // High level
+                g_logan_trigger_edge_rising = false;
+                g_logan_trigger_edge_falling = false;
+                g_logan_trigger_level_low = false;
+                g_logan_trigger_level_high = true;
+                break;
+              case 3: // Rising edge
+                g_logan_trigger_edge_rising = true;
+                g_logan_trigger_edge_falling = false;
+                g_logan_trigger_level_low = false;
+                g_logan_trigger_level_high = false;
+                break;
+              case 4: // Falling edge
+                g_logan_trigger_edge_rising = false;
+                g_logan_trigger_edge_falling = true;
+                g_logan_trigger_level_low = false;
+                g_logan_trigger_level_high = false;
+                break;
+              case 5: // Either edge
+                g_logan_trigger_edge_rising = true;
+                g_logan_trigger_edge_falling = true;
+                g_logan_trigger_level_low = false;
+                g_logan_trigger_level_high = false;
+                break;
+              default: // Default to rising edge
+                g_logan_trigger_edge_rising = true;
+                g_logan_trigger_edge_falling = false;
+                g_logan_trigger_level_low = false;
+                g_logan_trigger_level_high = false;
+                break;
             }
           }
+
+          // Start periodic sampling; trigger alignment happens inside the timer ISR
+          add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
 
           g_rx_word = 0; // consume
         }
@@ -988,18 +969,39 @@ void process_buffered_events()
         if (g_logan_continuous)
         {
           cancel_repeating_timer(&g_logan_timer);
-          g_logan_sample_index = 0;
 
-          // Continuous mode: always use immediate mode to avoid trigger alignment
+          g_logan_sample_index = 0;
+          g_logan_sampling_done = false;
+          g_logan_triggered = false;
+          g_logan_trigger_index = 0;
+          g_logan_pre_count = 0;
+          g_logan_pre_wr_index = 0;
+          g_logan_prev_trig_level = static_cast<bool>(gpio_get(LOGAN_PINS[g_logan_trigger_channel]));
+
+          const bool immediate_mode = (g_logan_trigger_mode == 0);
           g_logan_sampling_active = true;
-          g_logan_trigger_armed = false;
+          if (immediate_mode)
+          {
+            g_logan_trigger_armed = false;
+            g_logan_sampling_start_time = get_absolute_time();
+          }
+          else
+          {
+            g_logan_trigger_armed = true;
+            g_logan_sampling_start_time = 0;
+          }
+
           size_t rate_hz = SPIComm::rate_from_nibble(g_logan_rate_nibble);
           if (rate_hz < 1) rate_hz = 1;
           int64_t interval_us = (int64_t)((1000000 + (rate_hz / 2)) / rate_hz);
           if (interval_us <= 0) interval_us = 1;
-          g_logan_sampling_start_time = get_absolute_time();
-          // Take first sample immediately for zero initial latency
-          logan_capture_sample_now();
+
+          // Immediate mode without a pre-trigger window benefits from a zero-latency first sample
+          if (immediate_mode && g_logan_pre_capacity == 0)
+          {
+            logan_capture_sample_now();
+          }
+
           add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
         }
         else
