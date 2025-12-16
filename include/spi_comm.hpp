@@ -73,6 +73,11 @@ private:
     return type ^ action ^ value;
   }
 
+  static inline bool is_control_word(uint16_t w)
+  {
+    return (w == CMD_START) || (w == CMD_STOP);
+  }
+
   // Map samples nibble to number of 1-bit samples
   static inline size_t map_samples_nibble(uint8_t samples_nibble)
   {
@@ -120,9 +125,9 @@ private:
   static inline uint16_t create_event_packet(uint8_t type, uint8_t action, uint8_t value, uint8_t checksum)
   {
     return ((type & 0x0F) << 12) |
-           ((action & 0x0F) << 8) |
-           ((value & 0x0F) << 4) |
-           (checksum & 0x0F);
+          ((action & 0x0F) << 8) |
+          ((value & 0x0F) << 4) |
+          (checksum & 0x0F);
   }
 
   // Helper to check TX FIFO space
@@ -242,32 +247,128 @@ private:
     bool stop_seen = false;
     bool start_seen = false;
     uint16_t last_non_control = 0;
+    // Allow masters that clock 8-bit frames (CS held across two bytes)
+    static uint8_t partial_high_byte = 0;
+    static bool partial_high_valid = false;
 
     // Drain RX FIFO
     while (spi_is_readable(spi1))
     {
       uint16_t w = spi_get_hw(spi1)->dr;
-      if (w == CMD_STOP) { stop_seen = true; continue; }
-      if (w == CMD_START) { start_seen = true; continue; }
+
+      // If master sends 8-bit frames, assemble two bytes into one word
+      if (w <= 0x00FF)
+      {
+        if (!partial_high_valid)
+        {
+          partial_high_byte = static_cast<uint8_t>(w & 0xFF);
+          partial_high_valid = true;
+          continue;
+        }
+        else
+        {
+          w = static_cast<uint16_t>((static_cast<uint16_t>(partial_high_byte) << 8) |
+                                    static_cast<uint16_t>(w & 0xFF));
+          partial_high_valid = false;
+        }
+      }
+      else
+      {
+        // Any 16-bit frame clears partial state
+        partial_high_valid = false;
+      }
+
+      if (is_control_word(w))
+      {
+        if (w == CMD_STOP) { stop_seen = true; }
+        else               { start_seen = true; }
+        continue;
+      }
       // Only update last_non_control for non-zero words to avoid overwriting with zeros
       if (w != 0) { last_non_control = w; }
     }
+    // If FIFO drained with a dangling high byte, drop it to avoid false triggers
+    partial_high_valid = false;
 
     // Latch control commands as flags; do not publish them into g_rx_word
-    if (stop_seen) g_stop_requested = true;
-    if (start_seen) g_start_requested = true;
-    // Always capture the latest non-control RX word; prevents losing STOP if CONFIG precedes it
-    if (last_non_control != 0) g_rx_word = last_non_control;
+    bool control_seen = stop_seen || start_seen;
+    if (stop_seen) { g_stop_requested = true; g_rx_word = 0; }
+    if (start_seen) { g_start_requested = true; g_rx_word = 0; }
+    // Capture data only when no control command was present in the batch
+    if (!control_seen && last_non_control != 0) g_rx_word = last_non_control;
 
     // Service TX FIFO without disabling interrupts to keep GPIO IRQs responsive
     service_tx_fifo_locked();
   }
 
 public:
+  struct ControlFlags
+  {
+    bool start;
+    bool stop;
+  };
+
+  static constexpr uint16_t start_word() { return CMD_START; }
+  static constexpr uint16_t stop_word()  { return CMD_STOP;  }
+
   // True if a LOGAN bulk transfer is queued or currently active
   static inline bool is_logan_transfer_busy()
   {
     return logan_queue_active || logan_queued;
+  }
+
+  // Atomically capture and clear any latched control commands (START/STOP).
+  // Also consumes a pending g_rx_word if it equals a control word, ensuring
+  // control commands are never misinterpreted as data.
+  static inline ControlFlags consume_control_flags()
+  {
+    ControlFlags flags{false, false};
+
+    uint32_t status = save_and_disable_interrupts();
+
+    if (g_stop_requested)
+    {
+      flags.stop = true;
+      g_stop_requested = false;
+    }
+    if (g_start_requested)
+    {
+      flags.start = true;
+      g_start_requested = false;
+    }
+
+    uint16_t rx_snapshot = g_rx_word;
+    if (is_control_word(rx_snapshot))
+    {
+      flags.start = flags.start || (rx_snapshot == CMD_START);
+      flags.stop  = flags.stop  || (rx_snapshot == CMD_STOP);
+      g_rx_word = 0;
+    }
+    else if (flags.start || flags.stop)
+    {
+      // Drop any stale non-control word when a control command is present.
+      g_rx_word = 0;
+    }
+
+    restore_interrupts(status);
+    return flags;
+  }
+
+  // Raise control requests from non-ISR contexts with interrupt safety.
+  static inline void signal_stop_request(bool clear_rx_word = true)
+  {
+    uint32_t status = save_and_disable_interrupts();
+    g_stop_requested = true;
+    if (clear_rx_word) g_rx_word = 0;
+    restore_interrupts(status);
+  }
+
+  static inline void signal_start_request(bool clear_rx_word = true)
+  {
+    uint32_t status = save_and_disable_interrupts();
+    g_start_requested = true;
+    if (clear_rx_word) g_rx_word = 0;
+    restore_interrupts(status);
   }
 
   // Initialize SPI1 as a 16-bit slave and enable RX interrupt

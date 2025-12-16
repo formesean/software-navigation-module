@@ -30,12 +30,12 @@ volatile uint16_t g_rx_word = 0;
 volatile bool g_system_enabled = false;
 volatile bool g_stop_requested = false;
 volatile bool g_start_requested = false;
-const uint16_t START_CMD = 0xA11A;
-const uint16_t STOP_CMD = 0xA10B;
+const uint16_t START_CMD = SPIComm::start_word();
+const uint16_t STOP_CMD = SPIComm::stop_word();
 
 // Debounce timings
 const uint32_t ENCODER_DEBOUNCE_US = 3000;
-const uint32_t ENCODER_SW_DEBOUNCE_US = 20000;
+const uint32_t ENCODER_SW_DEBOUNCE_US = 50000;
 const uint32_t MACRO_KEY_DEBOUNCE_US = 20000;
 
 // Quadrature encoder state transition table (last_state<<2 | current_state)
@@ -54,6 +54,11 @@ volatile bool prev_encoder_sw_state = true;
 
 volatile bool macro_event_pending[5] = {false};
 volatile bool encoder_sw_event_pending = false;
+
+static inline bool control_allows_packets()
+{
+  return g_system_enabled && !g_stop_requested;
+}
 
 // Function prototypes
 void wait_for_usb_connect();
@@ -544,17 +549,19 @@ void shared_irq_handler()
         {
           prev_macro_state[i] = current_state;
           last_macro_debounce_time[i] = now;
-          // Allow multiple events without waiting for main-loop acknowledgment
-
-          uint16_t event_data = SPIComm::create_macro_key_event(i + 1, current_pressed);
-
-          // Try to queue immediately; fallback to ring buffer if busy/full
-          if (!SPIComm::queue_packet(event_data))
+          // Do not generate packets unless the system is running
+          if (control_allows_packets())
           {
-            ringBuffer.push(event_data);
-          }
+            uint16_t event_data = SPIComm::create_macro_key_event(i + 1, current_pressed);
 
-          request_led_blink();
+            // Try to queue immediately; fallback to ring buffer if busy/full
+            if (!SPIComm::queue_packet(event_data))
+            {
+              ringBuffer.push(event_data);
+            }
+
+            request_led_blink();
+          }
         }
       }
     }
@@ -583,15 +590,18 @@ void shared_irq_handler()
           bool clockwise = delta > 0;
           uint8_t steps = static_cast<uint8_t>(abs(delta));
 
-          uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
-
-          // Try to queue immediately; fallback to ring buffer if busy/full
-          if (!SPIComm::queue_packet(event_data))
+          if (control_allows_packets())
           {
-            ringBuffer.push(event_data);
-          }
+            uint16_t event_data = SPIComm::create_encoder_rotate_event(clockwise, steps);
 
-          request_led_blink();
+            // Try to queue immediately; fallback to ring buffer if busy/full
+            if (!SPIComm::queue_packet(event_data))
+            {
+              ringBuffer.push(event_data);
+            }
+
+            request_led_blink();
+          }
         }
 
         encoder_last_state = current_state;
@@ -615,19 +625,21 @@ void shared_irq_handler()
         last_encoder_button_event = now;
         // Allow multiple events without waiting for main-loop acknowledgment
 
-        uint16_t event_data = SPIComm::create_encoder_switch_event(current_pressed);
-
-        // Try to queue immediately; fallback to ring buffer if busy/full
-        if (!SPIComm::queue_packet(event_data))
+        if (control_allows_packets())
         {
-          ringBuffer.push(event_data);
-        }
+          uint16_t event_data = SPIComm::create_encoder_switch_event(current_pressed);
 
-        request_led_blink();
+          // Try to queue immediately; fallback to ring buffer if busy/full
+          if (!SPIComm::queue_packet(event_data))
+          {
+            ringBuffer.push(event_data);
+          }
+
+          request_led_blink();
+        }
       }
     }
   }
-
 }
 
 // Process deferred events, handle control commands, and manage LOGAN TX sequencing
@@ -639,216 +651,205 @@ void process_buffered_events()
 
   SPIComm::update_transmission_status();
 
-  // Control commands
-  if (g_stop_requested)
+  SPIComm::ControlFlags control = SPIComm::consume_control_flags();
+
+  if (control.stop)
   {
-    g_stop_requested = false;
     g_system_enabled = false;
     reset_system_state();
-    if (g_rx_word == STOP_CMD || g_rx_word == START_CMD) g_rx_word = 0;
     return;
   }
 
-  if (!g_system_enabled && g_start_requested)
+  if (!g_system_enabled && control.start)
   {
-    g_start_requested = false;
     g_system_enabled = true;
-    if (g_rx_word == START_CMD) g_rx_word = 0;
+  }
+
+  // Do not emit or process packets until a START has been received
+  if (!g_system_enabled)
+  {
+    return;
   }
 
   uint16_t rx_snapshot = g_rx_word;
   if (rx_snapshot != 0)
   {
-    if (rx_snapshot == STOP_CMD)
-    {
-      g_stop_requested = true;
-      g_rx_word = 0;
-      return;
-    }
-    else if (rx_snapshot == START_CMD)
-    {
-      g_start_requested = true;
-      g_rx_word = 0;
-    }
-    else
-    {
-      uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
-      uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
+    uint8_t rx_high_byte = (rx_snapshot >> 8) & 0xFF;
+    uint8_t rx_low_byte  =  rx_snapshot       & 0xFF;
 
-      // Prefer LOGAN header detection first, so single-shot (MSB=0) is not misread as SNM
-      bool msb_set = ((rx_high_byte & 0x80) != 0);
-      bool header_nonzero = (rx_high_byte != 0x00 || rx_low_byte != 0x00);
-      uint8_t type_nibble_peek = static_cast<uint8_t>((rx_high_byte >> 4) & 0x0F);
-      uint8_t chan_peek = static_cast<uint8_t>(type_nibble_peek & 0x07);
-      bool looks_like_logan = header_nonzero && (msb_set || (chan_peek >= 1 && chan_peek <= 4));
-      bool is_logan_cmd = looks_like_logan;
-      if (is_logan_cmd)
+    // Prefer LOGAN header detection first, so single-shot (MSB=0) is not misread as SNM
+    bool msb_set = ((rx_high_byte & 0x80) != 0);
+    bool header_nonzero = (rx_high_byte != 0x00 || rx_low_byte != 0x00);
+    uint8_t type_nibble_peek = static_cast<uint8_t>((rx_high_byte >> 4) & 0x0F);
+    uint8_t chan_peek = static_cast<uint8_t>(type_nibble_peek & 0x07);
+    bool looks_like_logan = header_nonzero && (msb_set || (chan_peek >= 1 && chan_peek <= 4));
+    bool is_logan_cmd = looks_like_logan;
+    if (is_logan_cmd)
+    {
+      uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // bccc (b=MSB for mode, c = channel 1..4)
+      uint8_t trig_mode_nib  =  rx_high_byte       & 0x0F;
+      uint8_t samples_nibble = (rx_low_byte  >> 4) & 0x0F;
+      uint8_t rate_nibble    =  rx_low_byte        & 0x0F;
+
+      uint8_t trig_chan_1to4 = type_nibble & 0x07; // 1..4 expected (0 reserved)
+      uint8_t trig_index = (trig_chan_1to4 >= 1 && trig_chan_1to4 <= 4) ? (uint8_t)(trig_chan_1to4 - 1) : 0;
+
+      if (samples_nibble == 0x0 && rate_nibble == 0x0)
       {
-        uint8_t type_nibble    = (rx_high_byte >> 4) & 0x0F; // bccc (b=MSB for mode, c = channel 1..4)
-        uint8_t trig_mode_nib  =  rx_high_byte       & 0x0F;
-        uint8_t samples_nibble = (rx_low_byte  >> 4) & 0x0F;
-        uint8_t rate_nibble    =  rx_low_byte        & 0x0F;
+        // LOGAN STOP
+        g_logan_continuous = false;
+        g_logan_sampling_active = false;
+        g_logan_sampling_done = false;
+        g_logan_abort_requested = true;
+        cancel_repeating_timer(&g_logan_timer);
+        g_logan_sample_index = 0;
+        g_logan_sample_target = 0;
+        g_logan_expected_words = 0;
+        SPIComm::cancel_logan_transfer();
+        g_logan_tx_sequence_active = false;
+        g_logan_tx_next_channel = 1;
+        g_rx_word = 0; // consume
+      }
+      else
+      {
+        // LOGAN START / (re-)arm
+        size_t expected_samples = SPIComm::samples_from_nibble(samples_nibble);
+        size_t max_samples = sizeof(g_logan_sample_buffer[0]) / sizeof(g_logan_sample_buffer[0][0]);
+        size_t requested_samples = (expected_samples > max_samples) ? max_samples : expected_samples;
+        size_t rate_hz     = SPIComm::rate_from_nibble(rate_nibble);
+        if (rate_hz < 1) rate_hz = 1;
+        int64_t interval_us = (int64_t)((1000000 + (rate_hz / 2)) / rate_hz);
+        if (interval_us <= 0) interval_us = 1;
 
-        uint8_t trig_chan_1to4 = type_nibble & 0x07; // 1..4 expected (0 reserved)
-        uint8_t trig_index = (trig_chan_1to4 >= 1 && trig_chan_1to4 <= 4) ? (uint8_t)(trig_chan_1to4 - 1) : 0;
+        cancel_repeating_timer(&g_logan_timer);
 
-        if (samples_nibble == 0x0 && rate_nibble == 0x0)
+        g_logan_samples_nibble = samples_nibble;
+        g_logan_rate_nibble    = rate_nibble;
+        // Capture exactly the requested window length
+        g_logan_sample_target = requested_samples;
+        g_logan_requested_samples = requested_samples;
+        g_logan_sample_index   = 0;
+        g_logan_sampling_done  = false;
+        // Continuous if MSB of type nibble set (cb_run_stop). Single-shot if MSB clear (cb_single)
+        g_logan_continuous      = msb_set;
+        g_logan_abort_requested = false; // clear any previous abort
+        // Transmit only the requested window length, not the doubled capture
+        g_logan_expected_words  = (requested_samples + 3) / 4;
+
+        // Pre-trigger configuration:
+        // - Immediate mode: pre-trigger = half window
+        // - Single-shot triggered: enable pre-trigger = half window to center trigger
+        // - Continuous: no pre-trigger
+        if (trig_mode_nib == 0)
         {
-          // LOGAN STOP
-          g_logan_continuous = false;
-          g_logan_sampling_active = false;
-          g_logan_sampling_done = false;
-          g_logan_abort_requested = true;
-          cancel_repeating_timer(&g_logan_timer);
-          g_logan_sample_index = 0;
-          g_logan_sample_target = 0;
-          g_logan_expected_words = 0;
-          SPIComm::cancel_logan_transfer();
-          g_logan_tx_sequence_active = false;
-          g_logan_tx_next_channel = 1;
-          g_rx_word = 0; // consume
+          g_logan_pre_capacity = (requested_samples / 2);
+          if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
         }
         else
         {
-          // LOGAN START / (re-)arm
-          size_t expected_samples = SPIComm::samples_from_nibble(samples_nibble);
-          size_t max_samples = sizeof(g_logan_sample_buffer[0]) / sizeof(g_logan_sample_buffer[0][0]);
-          size_t requested_samples = (expected_samples > max_samples) ? max_samples : expected_samples;
-          size_t rate_hz     = SPIComm::rate_from_nibble(rate_nibble);
-          if (rate_hz < 1) rate_hz = 1;
-          int64_t interval_us = (int64_t)((1000000 + (rate_hz / 2)) / rate_hz);
-          if (interval_us <= 0) interval_us = 1;
-
-          cancel_repeating_timer(&g_logan_timer);
-
-          g_logan_samples_nibble = samples_nibble;
-          g_logan_rate_nibble    = rate_nibble;
-          // Capture exactly the requested window length
-          g_logan_sample_target = requested_samples;
-          g_logan_requested_samples = requested_samples;
-          g_logan_sample_index   = 0;
-          g_logan_sampling_done  = false;
-          // Continuous if MSB of type nibble set (cb_run_stop). Single-shot if MSB clear (cb_single)
-          g_logan_continuous      = msb_set;
-          g_logan_abort_requested = false; // clear any previous abort
-          // Transmit only the requested window length, not the doubled capture
-          g_logan_expected_words  = (requested_samples + 3) / 4;
-
-          // Pre-trigger configuration:
-          // - Immediate mode: pre-trigger = half window
-          // - Single-shot triggered: enable pre-trigger = half window to center trigger
-          // - Continuous: no pre-trigger
-          if (trig_mode_nib == 0)
+          // For triggered captures, choose pre-trigger so that the trigger sample
+          // lands at index N/2 - 1 for even N (matching GUI 0 s placement)
+          size_t pre = requested_samples / 2;
+          if ((requested_samples % 2) == 0)
           {
-            g_logan_pre_capacity = (requested_samples / 2);
-            if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
-          }
-          else
-          {
-            // For triggered captures, choose pre-trigger so that the trigger sample
-            // lands at index N/2 - 1 for even N (matching GUI 0 s placement)
-            size_t pre = requested_samples / 2;
-            if ((requested_samples % 2) == 0)
-            {
-              if (pre > 0) pre -= 1; // shift one left for even counts
-            }
-
-            if (pre == 0 && requested_samples > 0)
-            {
-                pre = 1;
-            }
-
-            g_logan_pre_capacity = pre;
-            if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
-          }
-          g_logan_pre_count = 0;
-          g_logan_pre_wr_index = 0;
-          g_logan_triggered = false;
-          g_logan_trigger_index = 0;
-          g_logan_prev_trig_level = static_cast<bool>(gpio_get(LOGAN_PINS[trig_index]));
-
-          // Configure trigger settings for both single-shot and continuous modes
-          g_logan_trigger_mode = trig_mode_nib;
-          g_logan_trigger_channel = trig_index; // 0-based index into LOGAN_PINS
-
-          // Disable any existing trigger interrupts
-          for (uint8_t ch = 0; ch < 4; ++ch)
-          {
-            gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
+            if (pre > 0) pre -= 1; // shift one left for even counts
           }
 
-          g_logan_sampling_active = true;
-
-          if (trig_mode_nib == 0)
+          if (pre == 0 && requested_samples > 0)
           {
-            // Mode 0: immediate start (no trigger)
-            g_logan_trigger_armed = false;
-            g_logan_sampling_start_time = get_absolute_time();
-          }
-          else
-          {
-            // Mode 1+: triggered start (pre-trigger ring handled in timer)
-            g_logan_trigger_armed = true;
-
-            // Configure trigger detection based on mode (for edge/level semantics)
-            switch (trig_mode_nib)
-            {
-              case 1: // Low level
-                g_logan_trigger_edge_rising = false;
-                g_logan_trigger_edge_falling = false;
-                g_logan_trigger_level_low = true;
-                g_logan_trigger_level_high = false;
-                break;
-              case 2: // High level
-                g_logan_trigger_edge_rising = false;
-                g_logan_trigger_edge_falling = false;
-                g_logan_trigger_level_low = false;
-                g_logan_trigger_level_high = true;
-                break;
-              case 3: // Rising edge
-                g_logan_trigger_edge_rising = true;
-                g_logan_trigger_edge_falling = false;
-                g_logan_trigger_level_low = false;
-                g_logan_trigger_level_high = false;
-                break;
-              case 4: // Falling edge
-                g_logan_trigger_edge_rising = false;
-                g_logan_trigger_edge_falling = true;
-                g_logan_trigger_level_low = false;
-                g_logan_trigger_level_high = false;
-                break;
-              case 5: // Either edge
-                g_logan_trigger_edge_rising = true;
-                g_logan_trigger_edge_falling = true;
-                g_logan_trigger_level_low = false;
-                g_logan_trigger_level_high = false;
-                break;
-              default: // Default to rising edge
-                g_logan_trigger_edge_rising = true;
-                g_logan_trigger_edge_falling = false;
-                g_logan_trigger_level_low = false;
-                g_logan_trigger_level_high = false;
-                break;
-            }
+              pre = 1;
           }
 
-          // Start periodic sampling; trigger alignment happens inside the timer ISR
-          add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
-
-          g_rx_word = 0; // consume
+          g_logan_pre_capacity = pre;
+          if (g_logan_pre_capacity > PRETRIGGER_MAX) g_logan_pre_capacity = PRETRIGGER_MAX;
         }
-      }
-      else if (is_snm_event(rx_snapshot))
-      {
-        const uint8_t type = static_cast<uint8_t>((rx_snapshot >> 12) & 0x0F);
-        if (type == 0xA) // SNM announcement
+        g_logan_pre_count = 0;
+        g_logan_pre_wr_index = 0;
+        g_logan_triggered = false;
+        g_logan_trigger_index = 0;
+        g_logan_prev_trig_level = static_cast<bool>(gpio_get(LOGAN_PINS[trig_index]));
+
+        // Configure trigger settings for both single-shot and continuous modes
+        g_logan_trigger_mode = trig_mode_nib;
+        g_logan_trigger_channel = trig_index; // 0-based index into LOGAN_PINS
+
+        // Disable any existing trigger interrupts
+        for (uint8_t ch = 0; ch < 4; ++ch)
         {
-          handle_snm_announcement(rx_snapshot);
+          gpio_set_irq_enabled(LOGAN_PINS[ch], GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, false);
         }
-        // Other SNM events (macro keys, encoder) are handled by the existing event system
-        g_rx_word = 0; // consume the event
-        return;
+
+        g_logan_sampling_active = true;
+
+        if (trig_mode_nib == 0)
+        {
+          // Mode 0: immediate start (no trigger)
+          g_logan_trigger_armed = false;
+          g_logan_sampling_start_time = get_absolute_time();
+        }
+        else
+        {
+          // Mode 1+: triggered start (pre-trigger ring handled in timer)
+          g_logan_trigger_armed = true;
+
+          // Configure trigger detection based on mode (for edge/level semantics)
+          switch (trig_mode_nib)
+          {
+            case 1: // Low level
+              g_logan_trigger_edge_rising = false;
+              g_logan_trigger_edge_falling = false;
+              g_logan_trigger_level_low = true;
+              g_logan_trigger_level_high = false;
+              break;
+            case 2: // High level
+              g_logan_trigger_edge_rising = false;
+              g_logan_trigger_edge_falling = false;
+              g_logan_trigger_level_low = false;
+              g_logan_trigger_level_high = true;
+              break;
+            case 3: // Rising edge
+              g_logan_trigger_edge_rising = true;
+              g_logan_trigger_edge_falling = false;
+              g_logan_trigger_level_low = false;
+              g_logan_trigger_level_high = false;
+              break;
+            case 4: // Falling edge
+              g_logan_trigger_edge_rising = false;
+              g_logan_trigger_edge_falling = true;
+              g_logan_trigger_level_low = false;
+              g_logan_trigger_level_high = false;
+              break;
+            case 5: // Either edge
+              g_logan_trigger_edge_rising = true;
+              g_logan_trigger_edge_falling = true;
+              g_logan_trigger_level_low = false;
+              g_logan_trigger_level_high = false;
+              break;
+            default: // Default to rising edge
+              g_logan_trigger_edge_rising = true;
+              g_logan_trigger_edge_falling = false;
+              g_logan_trigger_level_low = false;
+              g_logan_trigger_level_high = false;
+              break;
+          }
+        }
+
+        // Start periodic sampling; trigger alignment happens inside the timer ISR
+        add_repeating_timer_us(-interval_us, logan_timer_callback, nullptr, &g_logan_timer);
+
+        g_rx_word = 0; // consume
       }
+    }
+    else if (is_snm_event(rx_snapshot))
+    {
+      const uint8_t type = static_cast<uint8_t>((rx_snapshot >> 12) & 0x0F);
+      if (type == 0xA) // SNM announcement
+      {
+        handle_snm_announcement(rx_snapshot);
+      }
+      // Other SNM events (macro keys, encoder) are handled by the existing event system
+      g_rx_word = 0; // consume the event
+      return;
     }
   }
 
@@ -1069,7 +1070,7 @@ void handle_snm_announcement(uint16_t word)
       request_led_blink();
 
       // Trigger system stop (same as STOP_CMD)
-      g_stop_requested = true;
+      SPIComm::signal_stop_request();
     }
   }
 }
